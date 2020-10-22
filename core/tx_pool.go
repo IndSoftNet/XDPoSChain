@@ -76,6 +76,14 @@ var (
 	// than some meaningful limit a user might use. This is not a consensus error
 	// making the transaction invalid, rather a DOS protection.
 	ErrOversizedData = errors.New("oversized data")
+
+	ErrZeroGasPrice = errors.New("zero gas price")
+
+	ErrUnderMinGasPrice = errors.New("under min gas price")
+
+	ErrDuplicateSpecialTransaction = errors.New("duplicate a special transaction")
+
+	ErrMinDeploySMC = errors.New("smart contract creation cost is under allowance")
 )
 
 var (
@@ -238,6 +246,9 @@ type TxPool struct {
 	reorgDoneCh     chan chan struct{}
 	reorgShutdownCh chan struct{}  // requests shutdown of scheduleReorgLoop
 	wg              sync.WaitGroup // tracks loop, scheduleReorgLoop
+
+	homestead bool
+	IsSigner  func(address common.Address) bool
 }
 
 type txpoolResetRequest struct {
@@ -333,7 +344,7 @@ func (pool *TxPool) loop() {
 			close(pool.reorgShutdownCh)
 			return
 
-		// Handle stats reporting ticks
+			// Handle stats reporting ticks
 		case <-report.C:
 			pool.mu.RLock()
 			pending, queued := pool.stats()
@@ -345,7 +356,7 @@ func (pool *TxPool) loop() {
 				prevPending, prevQueued, prevStales = pending, queued, stales
 			}
 
-		// Handle inactive account transaction eviction
+			// Handle inactive account transaction eviction
 		case <-evict.C:
 			pool.mu.Lock()
 			for addr := range pool.queue {
@@ -362,7 +373,7 @@ func (pool *TxPool) loop() {
 			}
 			pool.mu.Unlock()
 
-		// Handle local transaction journal rotation
+			// Handle local transaction journal rotation
 		case <-journal.C:
 			if pool.journal != nil {
 				pool.mu.Lock()
@@ -504,6 +515,14 @@ func (pool *TxPool) local() map[common.Address]types.Transactions {
 	return txs
 }
 
+func (pool *TxPool) GetSender(tx *types.Transaction) (common.Address, error) {
+	from, err := types.Sender(pool.signer, tx)
+	if err != nil {
+		return common.Address{}, ErrInvalidSender
+	}
+	return from, nil
+}
+
 // validateTx checks whether a transaction is valid according to the consensus
 // rules and adheres to some heuristic limits of the local node (price and size).
 func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
@@ -528,25 +547,48 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	// Drop non-local transactions under our own minimal accepted gas price
 	local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network
 	if !local && pool.gasPrice.Cmp(tx.GasPrice()) > 0 {
-		return ErrUnderpriced
+		if !tx.IsSpecialTransaction() || (pool.IsSigner != nil && !pool.IsSigner(from)) {
+			return ErrUnderpriced
+		}
 	}
 	// Ensure the transaction adheres to nonce ordering
 	if pool.currentState.GetNonce(from) > tx.Nonce() {
 		return ErrNonceTooLow
+	}
+	if pool.pendingNonces.get(from)+common.LimitThresholdNonceInQueue < tx.Nonce() {
+		return ErrNonceTooHigh
 	}
 	// Transactor should have enough funds to cover the costs
 	// cost == V + GP * GL
 	if pool.currentState.GetBalance(from).Cmp(tx.Cost()) < 0 {
 		return ErrInsufficientFunds
 	}
-	// Ensure the transaction has more gas than the basic tx fee.
-	intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, true)
-	if err != nil {
-		return err
+
+	if tx.To() == nil || (tx.To() != nil && !tx.IsSpecialTransaction()) {
+		// Ensure the transaction has more gas than the basic tx fee.
+		intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, true)
+		if err != nil {
+			return err
+		}
+		// Exclude check smart contract sign address.
+		if tx.Gas() < intrGas {
+			return ErrIntrinsicGas
+		}
+		// Check zero gas price.
+		if tx.GasPrice().Cmp(new(big.Int).SetInt64(0)) == 0 {
+			return ErrZeroGasPrice
+		}
+		// under min gas price
+		if tx.GasPrice().Cmp(new(big.Int).SetInt64(common.MinGasPrice)) < 0 {
+			return ErrUnderMinGasPrice
+		}
 	}
-	if tx.Gas() < intrGas {
-		return ErrIntrinsicGas
-	}
+
+	// minGasDeploySMC := new(big.Int).Mul(new(big.Int).SetUint64(10), new(big.Int).SetUint64(params.Ether))
+	// if tx.To() == nil && (tx.Cost().Cmp(minGasDeploySMC) < 0 || tx.GasPrice().Cmp(new(big.Int).SetUint64(10000*params.Shannon)) < 0) {
+	// 	return ErrMinDeploySMC
+	// }
+
 	return nil
 }
 
@@ -572,6 +614,10 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		return false, err
 	}
 
+	from, _ := types.Sender(pool.signer, tx) // already validated
+	if tx.IsSpecialTransaction() && pool.IsSigner != nil && pool.IsSigner(from) && pool.pendingNonces.get(from) == tx.Nonce() {
+		return pool.promoteSpecialTx(from, tx)
+	}
 	// If the transaction pool is full, discard underpriced transactions
 	if uint64(pool.all.Count()) >= pool.config.GlobalSlots+pool.config.GlobalQueue {
 		// If the new transaction is underpriced, don't accept it
@@ -589,8 +635,7 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		}
 	}
 
-	// Try to replace an existing transaction in the pending pool
-	from, _ := types.Sender(pool.signer, tx) // already validated
+	// Try to replace an existing transaction in the pending poo
 	if list := pool.pending[from]; list != nil && list.Overlaps(tx) {
 		// Nonce already pending, check if required price bump is met
 		inserted, old := list.Add(tx, pool.config.PriceBump)
@@ -717,6 +762,41 @@ func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.T
 	pool.pendingNonces.set(addr, tx.Nonce()+1)
 
 	return true
+}
+
+func (pool *TxPool) promoteSpecialTx(addr common.Address, tx *types.Transaction) (bool, error) {
+	// Try to insert the transaction into the pending queue
+	if pool.pending[addr] == nil {
+		pool.pending[addr] = newTxList(true)
+	}
+	list := pool.pending[addr]
+	old := list.txs.Get(tx.Nonce())
+	if old != nil && old.IsSpecialTransaction() {
+		return false, ErrDuplicateSpecialTransaction
+	}
+	// Otherwise discard any previous transaction and mark this
+	if old != nil {
+		pool.all.Remove(old.Hash())
+		pool.priced.Removed(1)
+
+		pendingReplaceMeter.Mark(1)
+	} else {
+		// Nothing was replaced, bump the pending counter
+		pendingCounter.Inc(1)
+	}
+	list.txs.Put(tx)
+	if cost := tx.Cost(); list.costcap.Cmp(cost) < 0 {
+		list.costcap = cost
+	}
+	if gas := tx.Gas(); list.gascap < gas {
+		list.gascap = gas
+	}
+	// Failsafe to work around direct pending inserts (tests)
+	if pool.all.Get(tx.Hash()) == nil {
+		pool.all.Add(tx)
+		pool.priced.Put(tx)
+	}
+	return true, nil
 }
 
 // AddLocals enqueues a batch of transactions into the pool if they are valid, marking the
@@ -1362,7 +1442,7 @@ func (pool *TxPool) demoteUnexecutables() {
 			gapped := list.Cap(0)
 			for _, tx := range gapped {
 				hash := tx.Hash()
-				log.Error("Demoting invalidated transaction", "hash", hash)
+				log.Warn("Demoting invalidated transaction", "hash", hash)
 				pool.enqueueTx(hash, tx)
 			}
 			pendingCounter.Dec(int64(len(gapped)))

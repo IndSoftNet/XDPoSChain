@@ -257,7 +257,10 @@ func (s *dialstate) checkDial(n *enode.Node, peers map[enode.ID]*Peer) error {
 	case dialing:
 		return errAlreadyDialing
 	case peers[n.ID()] != nil:
-		return errAlreadyConnected
+		exitsPeer := peers[n.ID()]
+		if exitsPeer.PairPeer != nil {
+			return errAlreadyConnected
+		}
 	case n.ID() == s.self:
 		return errSelf
 	case s.netrestrict != nil && !s.netrestrict.Contains(n.IP()):
@@ -291,8 +294,24 @@ func (t *dialTask) Do(srv *Server) {
 		// Try resolving the ID of static nodes if dialing failed.
 		if _, ok := err.(*dialError); ok && t.flags&staticDialedConn != 0 {
 			if t.resolve(srv) {
-				t.dial(srv, t.dest)
+				err = t.dial(srv, t.dest)
 			}
+		}
+	}
+	if err == nil {
+		err = t.dial(srv, t.dest)
+		if err != nil {
+			// Try resolving the ID of static nodes if dialing failed.
+			if _, ok := err.(*dialError); ok && t.flags&staticDialedConn != 0 {
+				if t.resolve(srv) {
+					err = t.dial(srv, t.dest)
+				}
+			}
+		}
+		if err == nil {
+			log.Trace("Dial pair connection success", "task", t.dest)
+		} else {
+			log.Trace("Dial pair connection error", "task", t.dest, "err", err)
 		}
 	}
 }

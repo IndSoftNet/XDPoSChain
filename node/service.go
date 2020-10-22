@@ -85,6 +85,11 @@ func (ctx *ServiceContext) Service(service interface{}) error {
 	return ErrServiceUnknown
 }
 
+// Get current node config.
+func (ctx *ServiceContext) GetConfig() *Config {
+	return ctx.config
+}
+
 // ExtRPCEnabled returns the indicator whether node enables the external
 // RPC(http, ws or graphql).
 func (ctx *ServiceContext) ExtRPCEnabled() bool {

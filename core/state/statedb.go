@@ -440,6 +440,14 @@ func (s *StateDB) deleteStateObject(stateObject *stateObject) {
 	s.setError(s.trie.TryDelete(addr[:]))
 }
 
+// DeleteAddress removes the address from the state trie.
+func (self *StateDB) DeleteAddress(addr common.Address) {
+	stateObject := self.getStateObject(addr)
+	if stateObject != nil && !stateObject.deleted {
+		self.deleteStateObject(stateObject)
+	}
+}
+
 // Retrieve a state object given by the address. Returns nil if not found.
 func (s *StateDB) getStateObject(addr common.Address) (stateObject *stateObject) {
 	// Prefer live objects
@@ -530,15 +538,16 @@ func (db *StateDB) ForEachStorage(addr common.Address, cb func(key, value common
 			}
 			continue
 		}
-
 		if len(it.Value) > 0 {
-			_, content, _, err := rlp.Split(it.Value)
-			if err != nil {
-				return err
-			}
-			if !cb(key, common.BytesToHash(content)) {
-				return nil
-			}
+			// using geth ver 1.8 instead of ver 1.9
+			cb(key, common.BytesToHash(it.Value))
+			// _, content, _, err := rlp.Split(it.Value)
+			// if err != nil {
+			// 	return err
+			// }
+			// if !cb(key, common.BytesToHash(content)) {
+			// 	return nil
+			// }
 		}
 	}
 	return nil

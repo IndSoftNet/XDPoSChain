@@ -40,6 +40,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
+	lru "github.com/hashicorp/golang-lru"
 )
 
 const (
@@ -94,12 +95,14 @@ type ProtocolManager struct {
 
 	// wait group is used for graceful shutdowns during downloading
 	// and processing
-	wg sync.WaitGroup
+	wg       sync.WaitGroup
+	knownTxs *lru.Cache
 }
 
 // NewProtocolManager returns a new Ethereum sub protocol manager. The Ethereum sub protocol manages peers capable
 // with the Ethereum network.
 func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCheckpoint, mode downloader.SyncMode, networkID uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database, cacheLimit int, whitelist map[uint64]common.Hash) (*ProtocolManager, error) {
+	knownTxs, _ := lru.New(maxKnownTxs)
 	// Create the protocol manager with the base fields
 	manager := &ProtocolManager{
 		networkID:   networkID,
@@ -112,6 +115,7 @@ func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCh
 		noMorePeers: make(chan struct{}),
 		txsyncCh:    make(chan *txsync),
 		quitSync:    make(chan struct{}),
+		knownTxs:    knownTxs,
 	}
 	if mode == downloader.FullSync {
 		// The database seems empty as the current block is the genesis. Yet the fast
@@ -158,7 +162,7 @@ func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCh
 	heighter := func() uint64 {
 		return blockchain.CurrentBlock().NumberU64()
 	}
-	inserter := func(blocks types.Blocks) (int, error) {
+	inserter := func(block *types.Block) error {
 		// If sync hasn't reached the checkpoint yet, deny importing weird blocks.
 		//
 		// Ideally we would also compare the head block's timestamp and similarly reject
@@ -166,8 +170,8 @@ func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCh
 		// case when starting new networks, where the genesis might be ancient (0 unix)
 		// which would prevent full nodes from accepting it.
 		if manager.blockchain.CurrentBlock().NumberU64() < manager.checkpointNumber {
-			log.Warn("Unsynced yet, discarded propagated block", "number", blocks[0].Number(), "hash", blocks[0].Hash())
-			return 0, nil
+			log.Warn("Unsynced yet, discarded propagated block", "number", block.Number(), "hash", block.Hash())
+			return nil
 		}
 		// If fast sync is running, deny importing weird blocks. This is a problematic
 		// clause when starting up a new network, because fast-syncing miners might not
@@ -175,16 +179,26 @@ func NewProtocolManager(config *params.ChainConfig, checkpoint *params.TrustedCh
 		// out a way yet where nodes can decide unilaterally whether the network is new
 		// or not. This should be fixed if we figure out a solution.
 		if atomic.LoadUint32(&manager.fastSync) == 1 {
-			log.Warn("Fast syncing, discarded propagated block", "number", blocks[0].Number(), "hash", blocks[0].Hash())
-			return 0, nil
+			log.Warn("Fast syncing, discarded propagated block", "number", block.Number(), "hash", block.Hash())
+			return nil
 		}
-		n, err := manager.blockchain.InsertChain(blocks)
+		err := manager.blockchain.InsertBlock(block)
 		if err == nil {
 			atomic.StoreUint32(&manager.acceptTxs, 1) // Mark initial sync done on any fetcher import
 		}
-		return n, err
+		return err
 	}
-	manager.fetcher = fetcher.New(blockchain.GetBlockByHash, validator, manager.BroadcastBlock, heighter, inserter, manager.removePeer)
+
+	prepare := func(block *types.Block) error {
+		// If fast sync is running, deny importing weird blocks
+		if atomic.LoadUint32(&manager.fastSync) == 1 {
+			log.Warn("Discarded bad propagated block", "number", block.Number(), "hash", block.Hash())
+			return nil
+		}
+		atomic.StoreUint32(&manager.acceptTxs, 1) // Mark initial sync done on any fetcher import
+		return manager.blockchain.PrepareBlock(block)
+	}
+	manager.fetcher = fetcher.New(blockchain.GetBlockByHash, validator, manager.BroadcastBlock, heighter, inserter, prepare, manager.removePeer)
 
 	return manager, nil
 }
@@ -233,7 +247,7 @@ func (pm *ProtocolManager) removePeer(id string) {
 	// Unregister the peer from the downloader and Ethereum peer set
 	pm.downloader.UnregisterPeer(id)
 	if err := pm.peers.Unregister(id); err != nil {
-		log.Error("Peer removal failed", "peer", id, "err", err)
+		log.Warn("Peer removal failed", "peer", id, "err", err)
 	}
 	// Hard disconnect at the networking layer
 	if peer != nil {
@@ -312,39 +326,42 @@ func (pm *ProtocolManager) handle(p *peer) error {
 		rw.Init(p.version)
 	}
 	// Register the peer locally
-	if err := pm.peers.Register(p); err != nil {
+	err := pm.peers.Register(p)
+	if err != nil && err != p2p.ErrAddPairPeer {
 		p.Log().Error("Ethereum peer registration failed", "err", err)
 		return err
 	}
 	defer pm.removePeer(p.id)
-
-	// Register the peer in the downloader. If the downloader considers it banned, we disconnect
-	if err := pm.downloader.RegisterPeer(p.id, p.version, p); err != nil {
-		return err
-	}
-	// Propagate existing transactions. new transactions appearing
-	// after this will be sent via broadcasts.
-	pm.syncTransactions(p)
-
-	// If we have a trusted CHT, reject all peers below that (avoid fast sync eclipse)
-	if pm.checkpointHash != (common.Hash{}) {
-		// Request the peer's checkpoint header for chain height/weight validation
-		if err := p.RequestHeadersByNumber(pm.checkpointNumber, 1, 0, false); err != nil {
+	if err != p2p.ErrAddPairPeer {
+		// Register the peer in the downloader. If the downloader considers it banned, we disconnect
+		if err := pm.downloader.RegisterPeer(p.id, p.version, p); err != nil {
 			return err
 		}
-		// Start a timer to disconnect if the peer doesn't reply in time
-		p.syncDrop = time.AfterFunc(syncChallengeTimeout, func() {
-			p.Log().Warn("Checkpoint challenge timed out, dropping", "addr", p.RemoteAddr(), "type", p.Name())
-			pm.removePeer(p.id)
-		})
-		// Make sure it's cleaned up if the peer dies off
-		defer func() {
-			if p.syncDrop != nil {
-				p.syncDrop.Stop()
-				p.syncDrop = nil
+		// Propagate existing transactions. new transactions appearing
+		// after this will be sent via broadcasts.
+		pm.syncTransactions(p)
+
+		// If we have a trusted CHT, reject all peers below that (avoid fast sync eclipse)
+		if pm.checkpointHash != (common.Hash{}) {
+			// Request the peer's checkpoint header for chain height/weight validation
+			if err := p.RequestHeadersByNumber(pm.checkpointNumber, 1, 0, false); err != nil {
+				return err
 			}
-		}()
+			// Start a timer to disconnect if the peer doesn't reply in time
+			p.syncDrop = time.AfterFunc(syncChallengeTimeout, func() {
+				p.Log().Warn("Checkpoint challenge timed out, dropping", "addr", p.RemoteAddr(), "type", p.Name())
+				pm.removePeer(p.id)
+			})
+			// Make sure it's cleaned up if the peer dies off
+			defer func() {
+				if p.syncDrop != nil {
+					p.syncDrop.Stop()
+					p.syncDrop = nil
+				}
+			}()
+		}
 	}
+
 	// If we have any explicit whitelist block hashes, request them
 	for number := range pm.whitelist {
 		if err := p.RequestHeadersByNumber(number, 1, 0, false); err != nil {
@@ -379,7 +396,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		// Status messages should never arrive after the handshake
 		return errResp(ErrExtraStatusMsg, "uncontrolled status message")
 
-	// Block header query, collect the requested headers and reply
+		// Block header query, collect the requested headers and reply
 	case msg.Code == GetBlockHeadersMsg:
 		// Decode the complex header query
 		var query getBlockHeadersData
@@ -723,12 +740,19 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&txs); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
+		var unkownTxs []*types.Transaction
 		for i, tx := range txs {
 			// Validate and mark the remote transaction
 			if tx == nil {
 				return errResp(ErrDecode, "transaction %d is nil", i)
 			}
 			p.MarkTransaction(tx.Hash())
+			exist, _ := pm.knownTxs.ContainsOrAdd(tx.Hash(), true)
+			if !exist {
+				unkownTxs = append(unkownTxs, tx)
+			} else {
+				log.Trace("Discard known tx", "hash", tx.Hash(), "nonce", tx.Nonce(), "to", tx.To())
+			}
 		}
 		pm.txpool.AddRemotes(txs)
 
@@ -766,7 +790,7 @@ func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 		for _, peer := range transfer {
 			peer.AsyncSendNewBlock(block, td)
 		}
-		log.Trace("Propagated block", "hash", hash, "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
+		log.Trace("Propagated block", "hash", hash, "recipients", len(peers), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
 		return
 	}
 	// Otherwise if the block is indeed in out own chain, announce it
@@ -802,8 +826,8 @@ func (pm *ProtocolManager) minedBroadcastLoop() {
 	// automatically stops if unsubscribe
 	for obj := range pm.minedBlockSub.Chan() {
 		if ev, ok := obj.Data.(core.NewMinedBlockEvent); ok {
-			pm.BroadcastBlock(ev.Block, true)  // First propagate block to peers
-			pm.BroadcastBlock(ev.Block, false) // Only then announce to the rest
+			pm.BroadcastBlock(ev.Block, true) // First propagate block to peers
+			// pm.BroadcastBlock(ev.Block, false) // Only then announce to the rest
 		}
 	}
 }

@@ -748,17 +748,24 @@ running:
 					p.events = &srv.peerFeed
 				}
 				name := truncateName(c.name)
-				p.log.Debug("Adding p2p peer", "addr", p.RemoteAddr(), "peers", len(peers)+1, "name", name)
+
 				go srv.runPeer(p)
-				peers[c.node.ID()] = p
-				if p.Inbound() {
-					inboundCount++
+				if peers[c.node.ID()] != nil {
+					peers[c.node.ID()].PairPeer = p
+					p.log.Debug("Adding p2p peer", "addr", p.RemoteAddr(), "peers", len(peers)+1, "name", name)
+				} else {
+					peers[c.node.ID()] = p
+					p.log.Debug("Adding p2p peer", "addr", p.RemoteAddr(), "peers", len(peers)+1, "name", name)
+
+					if p.Inbound() {
+						inboundCount++
+					}
 				}
+				// The dialer logic relies on the assumption that
+				// dial tasks complete after the peer has been added or
+				// discarded. Unblock the task last.
+				c.cont <- err
 			}
-			// The dialer logic relies on the assumption that
-			// dial tasks complete after the peer has been added or
-			// discarded. Unblock the task last.
-			c.cont <- err
 
 		case pd := <-srv.delpeer:
 			// A peer disconnected.
@@ -801,7 +808,11 @@ func (srv *Server) postHandshakeChecks(peers map[enode.ID]*Peer, inboundCount in
 	case !c.is(trustedConn) && c.is(inboundConn) && inboundCount >= srv.maxInboundConns():
 		return DiscTooManyPeers
 	case peers[c.node.ID()] != nil:
-		return DiscAlreadyConnected
+		exitPeer := peers[c.node.ID()]
+		if exitPeer.PairPeer != nil {
+			return DiscAlreadyConnected
+		}
+		return nil
 	case c.node.ID() == srv.localnode.ID():
 		return DiscSelf
 	default:

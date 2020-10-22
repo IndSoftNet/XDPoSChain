@@ -46,11 +46,11 @@ var (
 	MaxReceiptFetch = 256 // Amount of transaction receipts to allow fetching per request
 	MaxStateFetch   = 384 // Amount of node state values to allow fetching per request
 
-	rttMinEstimate   = 2 * time.Second  // Minimum round-trip time to target for download requests
-	rttMaxEstimate   = 20 * time.Second // Maximum round-trip time to target for download requests
-	rttMinConfidence = 0.1              // Worse confidence factor in our estimated RTT value
-	ttlScaling       = 3                // Constant scaling factor for RTT -> TTL conversion
-	ttlLimit         = time.Minute      // Maximum TTL allowance to prevent reaching crazy timeouts
+	rttMinEstimate   = 2 * time.Second // Minimum round-trip time to target for download requests
+	rttMaxEstimate   = 5 * time.Second // Maximum round-trip time to target for download requests
+	rttMinConfidence = 0.1             // Worse confidence factor in our estimated RTT value
+	ttlScaling       = 2               // Constant scaling factor for RTT -> TTL conversion
+	ttlLimit         = 5 * time.Second // Maximum TTL allowance to prevent reaching crazy timeouts
 
 	qosTuningPeers   = 5    // Number of peers to tune based on (best peers)
 	qosConfidenceCap = 10   // Number of peers above which not to modify RTT confidence
@@ -90,6 +90,7 @@ var (
 	errCanceled                = errors.New("syncing canceled (requested)")
 	errNoSyncActive            = errors.New("no sync active")
 	errTooOld                  = errors.New("peer doesn't speak recent enough protocol version (need version >= 62)")
+	errEnoughBlock             = errors.New("downloader download enough block")
 )
 
 type Downloader struct {
@@ -182,6 +183,7 @@ type LightChain interface {
 
 // BlockChain encapsulates functions required to sync a (full or fast) blockchain.
 type BlockChain interface {
+	Config() *params.ChainConfig
 	LightChain
 
 	// HasBlock verifies a block's presence in the local chain.
@@ -309,7 +311,7 @@ func (d *Downloader) UnregisterPeer(id string) error {
 	logger := log.New("peer", id)
 	logger.Trace("Unregistering sync peer")
 	if err := d.peers.Unregister(id); err != nil {
-		logger.Error("Failed to unregister sync peer", "err", err)
+		logger.Warn("Failed to unregister sync peer", "err", err)
 		return err
 	}
 	d.queue.Revoke(id)
@@ -434,7 +436,7 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	}(time.Now())
 
 	// Look up the sync boundaries: the common ancestor and the target block
-	latest, err := d.fetchHeight(p)
+	latest, err := d.fetchHeight(p, hash)
 	if err != nil {
 		return err
 	}
@@ -519,7 +521,7 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	if d.mode == FastSync {
 		fetchers = append(fetchers, func() error { return d.processFastSyncContent(latest) })
 	} else if d.mode == FullSync {
-		fetchers = append(fetchers, d.processFullSyncContent)
+		fetchers = append(fetchers, func() error { return d.processFullSyncContent(height) })
 	}
 	return d.spawnSync(fetchers)
 }
@@ -548,6 +550,9 @@ func (d *Downloader) spawnSync(fetchers []func() error) error {
 	}
 	d.queue.Close()
 	d.Cancel()
+	if err == errEnoughBlock {
+		return nil
+	}
 	return err
 }
 
@@ -596,12 +601,10 @@ func (d *Downloader) Terminate() {
 
 // fetchHeight retrieves the head header of the remote peer to aid in estimating
 // the total time a pending synchronisation would take.
-func (d *Downloader) fetchHeight(p *peerConnection) (*types.Header, error) {
-	p.log.Debug("Retrieving remote chain height")
+func (d *Downloader) fetchHeight(p *peerConnection, hash common.Hash) (*types.Header, error) {
 
 	// Request the advertised remote head block and wait for the response
-	head, _ := p.peer.Head()
-	go p.peer.RequestHeadersByHash(head, 1, 0, false)
+	go p.peer.RequestHeadersByHash(hash, 1, 0, false)
 
 	ttl := d.requestTTL()
 	timeout := time.After(ttl)
@@ -1519,17 +1522,51 @@ func (d *Downloader) processHeaders(origin uint64, pivot uint64, td *big.Int) er
 }
 
 // processFullSyncContent takes fetch results from the queue and imports them into the chain.
-func (d *Downloader) processFullSyncContent() error {
+func (d *Downloader) processFullSyncContent(height uint64) error {
 	for {
 		results := d.queue.Results(true)
 		if len(results) == 0 {
 			return nil
 		}
-		if d.chainInsertHook != nil {
-			d.chainInsertHook(results)
+		if d.blockchain.Config() != nil && d.blockchain.Config().XDPoS != nil {
+			epoch := d.blockchain.Config().XDPoS.Epoch
+			gap := d.blockchain.Config().XDPoS.Gap
+			inserts := []*fetchResult{}
+			for i := 0; i < len(results); i++ {
+				number := results[i].Header.Number.Uint64() % epoch
+				if number == 0 || number == epoch-1 || number == epoch-gap {
+					inserts = append(inserts, results[i])
+					if d.chainInsertHook != nil {
+						d.chainInsertHook(inserts)
+					}
+					if err := d.importBlockResults(inserts); err != nil {
+						return err
+					}
+					inserts = []*fetchResult{}
+				} else {
+					inserts = append(inserts, results[i])
+				}
+			}
+			if len(inserts) > 0 {
+				if d.chainInsertHook != nil {
+					d.chainInsertHook(inserts)
+				}
+				if err := d.importBlockResults(inserts); err != nil {
+					return err
+				}
+			}
+		} else {
+			if d.chainInsertHook != nil {
+				d.chainInsertHook(results)
+			}
+			if err := d.importBlockResults(results); err != nil {
+				return err
+			}
 		}
-		if err := d.importBlockResults(results); err != nil {
-			return err
+		latest := results[len(results)-1]
+		if latest.Header != nil && latest.Header.Number.Uint64() > height {
+			log.Debug("Force stop because downloading enough block", "height", height, "latest", latest.Header.Number.Uint64())
+			return errEnoughBlock
 		}
 	}
 }
@@ -1566,6 +1603,7 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 		}
 		return errInvalidChain
 	}
+
 	return nil
 }
 

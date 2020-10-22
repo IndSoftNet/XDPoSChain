@@ -35,7 +35,17 @@ const (
 	// HashLength is the expected length of the hash
 	HashLength = 32
 	// AddressLength is the expected length of the address
-	AddressLength = 20
+	AddressLength       = 20
+	MasternodeVotingSMC = "xdc0000000000000000000000000000000000000088"
+	BlockSigners        = "xdc0000000000000000000000000000000000000089"
+	RandomizeSMC        = "xdc0000000000000000000000000000000000000090"
+	FoudationAddr       = "xdc746249C61f5832C5eEd53172776b460491bDcd5C"
+	TeamAddr            = "xdc0000000000000000000000000000000000000099"
+	VoteMethod          = "0x6dd7d8ea"
+	UnvoteMethod        = "0x02aa9be2"
+	ProposeMethod       = "0x01267951"
+	ResignMethod        = "0xae6e43f5"
+	SignMethod          = "0xe341eaa4"
 )
 
 var (
@@ -193,6 +203,9 @@ func HexToAddress(s string) Address { return BytesToAddress(FromHex(s)) }
 // IsHexAddress verifies whether a string can represent a valid hex-encoded
 // Ethereum address or not.
 func IsHexAddress(s string) bool {
+	if hasXDCPrefix(s) {
+		s = s[3:]
+	}
 	if hasHexPrefix(s) {
 		s = s[2:]
 	}
@@ -224,7 +237,7 @@ func (a Address) Hex() string {
 			result[i] -= 32
 		}
 	}
-	return "0x" + string(result)
+	return "xdc" + string(result)
 }
 
 // String implements fmt.Stringer.
@@ -249,7 +262,7 @@ func (a *Address) SetBytes(b []byte) {
 
 // MarshalText returns the hex representation of a.
 func (a Address) MarshalText() ([]byte, error) {
-	return hexutil.Bytes(a[:]).MarshalText()
+	return hexutil.Bytes(a[:]).MarshalXDCText()
 }
 
 // UnmarshalText parses a hash in hex syntax.
@@ -306,6 +319,43 @@ func (a *UnprefixedAddress) UnmarshalText(input []byte) error {
 // MarshalText encodes the address as hex.
 func (a UnprefixedAddress) MarshalText() ([]byte, error) {
 	return []byte(hex.EncodeToString(a[:])), nil
+}
+
+// Extract validators from byte array.
+func RemoveItemFromArray(array []Address, items []Address) []Address {
+	if len(items) == 0 {
+		return array
+	}
+
+	for _, item := range items {
+		for i := len(array) - 1; i >= 0; i-- {
+			if array[i] == item {
+				array = append(array[:i], array[i+1:]...)
+			}
+		}
+	}
+
+	return array
+}
+
+// Extract validators from byte array.
+func ExtractAddressToBytes(penalties []Address) []byte {
+	data := []byte{}
+	for _, signer := range penalties {
+		data = append(data, signer[:]...)
+	}
+	return data
+}
+
+func ExtractAddressFromBytes(bytePenalties []byte) []Address {
+	if bytePenalties != nil && len(bytePenalties) < AddressLength {
+		return []Address{}
+	}
+	penalties := make([]Address, len(bytePenalties)/AddressLength)
+	for i := 0; i < len(penalties); i++ {
+		copy(penalties[i][:], bytePenalties[i*AddressLength:])
+	}
+	return penalties
 }
 
 // MixedcaseAddress retains the original string, which may or may not be

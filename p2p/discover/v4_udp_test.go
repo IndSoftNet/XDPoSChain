@@ -292,7 +292,7 @@ func TestUDPv4_findnode(t *testing.T) {
 	waitNeighbors := func(want []*node) {
 		test.waitPacketOut(func(p *neighborsV4, to *net.UDPAddr, hash []byte) {
 			if len(p.Nodes) != len(want) {
-				t.Errorf("wrong number of results: got %d, want %d", len(p.Nodes), bucketSize)
+				t.Errorf("wrong number of results: got %d, want %d", len(p.Nodes), bucketSizeTest)
 			}
 			for i, n := range p.Nodes {
 				if n.ID.id() != want[i].ID() {

@@ -218,7 +218,7 @@ func TestDialStateDynDial(t *testing.T) {
 					&discoverTask{},
 				},
 				new: []task{
-					&discoverTask{},
+					&waitExpireTask{Duration: 14 * time.Second},
 				},
 			},
 		},
@@ -308,6 +308,9 @@ func TestDialStateDynDialBootnode(t *testing.T) {
 					&dialTask{flags: dynDialedConn, dest: newNode(uintID(1), nil)},
 					&dialTask{flags: dynDialedConn, dest: newNode(uintID(4), nil)},
 				},
+				new: []task{
+					&dialTask{flags: dynDialedConn, dest: &discover.Node{ID: uintID(4)}},
+				},
 			},
 		},
 	})
@@ -379,6 +382,9 @@ func TestDialStateDynDialFromTable(t *testing.T) {
 					&dialTask{flags: dynDialedConn, dest: newNode(uintID(10), nil)},
 					&dialTask{flags: dynDialedConn, dest: newNode(uintID(11), nil)},
 					&dialTask{flags: dynDialedConn, dest: newNode(uintID(12), nil)},
+				},
+				new: []task{
+					&discoverTask{},
 				},
 			},
 			// Waiting for expiry. No waitExpireTask is launched because the
@@ -482,6 +488,9 @@ func TestDialStateStaticDial(t *testing.T) {
 					{rw: &conn{flags: dynDialedConn, node: newNode(uintID(2), nil)}},
 					{rw: &conn{flags: staticDialedConn, node: newNode(uintID(3), nil)}},
 				},
+				new: []task{
+					&dialTask{flags: staticDialedConn, dest: &discover.Node{ID: uintID(3)}},
+				},
 				done: []task{
 					&dialTask{flags: staticDialedConn, dest: newNode(uintID(3), nil)},
 				},
@@ -566,6 +575,10 @@ func TestDialStateCache(t *testing.T) {
 				done: []task{
 					&dialTask{flags: staticDialedConn, dest: newNode(uintID(1), nil)},
 					&dialTask{flags: staticDialedConn, dest: newNode(uintID(2), nil)},
+				},
+				new: []task{
+					&dialTask{flags: staticDialedConn, dest: &discover.Node{ID: uintID(1)}},
+					&dialTask{flags: staticDialedConn, dest: &discover.Node{ID: uintID(2)}},
 				},
 			},
 			// A salvage task is launched to wait for node 3's history

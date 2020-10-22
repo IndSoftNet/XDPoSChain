@@ -36,7 +36,7 @@ import (
 var Memsize memsizeui.Handler
 
 var (
-	verbosityFlag = cli.IntFlag{
+	VerbosityFlag = cli.IntFlag{
 		Name:  "verbosity",
 		Usage: "Logging verbosity: 0=silent, 1=error, 2=warn, 3=info, 4=debug, 5=detail",
 		Value: 3,
@@ -90,14 +90,22 @@ var (
 
 // Flags holds all command-line flags required for debugging.
 var Flags = []cli.Flag{
-	verbosityFlag, vmoduleFlag, backtraceAtFlag, debugFlag,
-	pprofFlag, pprofAddrFlag, pprofPortFlag,
-	memprofilerateFlag, blockprofilerateFlag, cpuprofileFlag, traceFlag,
+	VerbosityFlag,
+	//vmoduleFlag,
+	//backtraceAtFlag,
+	//debugFlag,
+	//pprofFlag,
+	//pprofAddrFlag,
+	//pprofPortFlag,
+	//memprofilerateFlag,
+	//blockprofilerateFlag,
+	//cpuprofileFlag,
+	//traceFlag,
 }
 
 var (
 	ostream log.Handler
-	glogger *log.GlogHandler
+	Glogger *log.GlogHandler
 )
 
 func init() {
@@ -107,7 +115,7 @@ func init() {
 		output = colorable.NewColorableStderr()
 	}
 	ostream = log.StreamHandler(output, log.TerminalFormat(usecolor))
-	glogger = log.NewGlogHandler(ostream)
+	Glogger = log.NewGlogHandler(ostream)
 }
 
 // Setup initializes profiling and logging based on the CLI flags.
@@ -124,12 +132,12 @@ func Setup(ctx *cli.Context, logdir string) error {
 		if err != nil {
 			return err
 		}
-		glogger.SetHandler(log.MultiHandler(ostream, rfh))
+		Glogger.SetHandler(log.MultiHandler(ostream, rfh))
 	}
-	glogger.Verbosity(log.Lvl(ctx.GlobalInt(verbosityFlag.Name)))
-	glogger.Vmodule(ctx.GlobalString(vmoduleFlag.Name))
-	glogger.BacktraceAt(ctx.GlobalString(backtraceAtFlag.Name))
-	log.Root().SetHandler(glogger)
+	Glogger.Verbosity(log.Lvl(ctx.GlobalInt(VerbosityFlag.Name)))
+	Glogger.Vmodule(ctx.GlobalString(vmoduleFlag.Name))
+	Glogger.BacktraceAt(ctx.GlobalString(backtraceAtFlag.Name))
+	log.Root().SetHandler(Glogger)
 
 	// profiling, tracing
 	runtime.MemProfileRate = ctx.GlobalInt(memprofilerateFlag.Name)

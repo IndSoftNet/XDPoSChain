@@ -22,6 +22,7 @@ var Modules = map[string]string{
 	"admin":      AdminJs,
 	"chequebook": ChequebookJs,
 	"clique":     CliqueJs,
+	"XDPoS":      XDPoSJS,
 	"ethash":     EthashJs,
 	"debug":      DebugJs,
 	"eth":        EthJs,
@@ -107,6 +108,42 @@ web3._extend({
 		new web3._extend.Property({
 			name: 'proposals',
 			getter: 'clique_proposals'
+		}),
+	]
+});
+`
+
+const XDPoSJS = `
+web3._extend({
+	property: 'XDPoS',
+	methods: [
+		new web3._extend.Method({
+			name: 'getSnapshot',
+			call: 'XDPoS_getSnapshot',
+			params: 1,
+			inputFormatter: [null]
+		}),
+		new web3._extend.Method({
+			name: 'getSnapshotAtHash',
+			call: 'XDPoS_getSnapshotAtHash',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'getSigners',
+			call: 'XDPoS_getSigners',
+			params: 1,
+			inputFormatter: [null]
+		}),
+		new web3._extend.Method({
+			name: 'getSignersAtHash',
+			call: 'XDPoS_getSignersAtHash',
+			params: 1
+		}),
+	],
+	properties: [
+		new web3._extend.Property({
+			name: 'proposals',
+			getter: 'XDPoS_proposals'
 		}),
 	]
 });
@@ -486,6 +523,11 @@ web3._extend({
 		new web3._extend.Method({
 			name: 'getRawTransaction',
 			call: 'eth_getRawTransactionByHash',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'getRewardByHash',
+			call: 'eth_getRewardByHash',
 			params: 1
 		}),
 		new web3._extend.Method({

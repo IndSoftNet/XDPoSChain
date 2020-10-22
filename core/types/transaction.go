@@ -35,6 +35,15 @@ var (
 	ErrInvalidSig = errors.New("invalid transaction v, r, s values")
 )
 
+// TODO: do later here
+// deriveSigner makes a *best* guess about which signer to use.
+func deriveSigner(V *big.Int) Signer {
+	if V.Sign() != 0 && isProtectedV(V) {
+		return NewEIP155Signer(deriveChainId(V))
+	}
+	return HomesteadSigner{}
+}
+
 type Transaction struct {
 	data txdata
 	// caches
@@ -189,6 +198,19 @@ func (tx *Transaction) To() *common.Address {
 	return &to
 }
 
+// TODO: do later here
+func (tx *Transaction) From() *common.Address {
+	if tx.data.V != nil {
+		signer := deriveSigner(tx.data.V)
+		f, err := Sender(signer, tx)
+		if err != nil {
+			return nil
+		}
+		return &f
+	}
+	return nil
+}
+
 // Hash hashes the RLP encoding of tx.
 // It uniquely identifies the transaction.
 func (tx *Transaction) Hash() common.Hash {
@@ -198,6 +220,11 @@ func (tx *Transaction) Hash() common.Hash {
 	v := rlpHash(tx)
 	tx.hash.Store(v)
 	return v
+}
+
+func (tx *Transaction) CacheHash() {
+	v := rlpHash(tx)
+	tx.hash.Store(v)
 }
 
 // Size returns the true RLP encoded storage size of the transaction, either by
@@ -257,6 +284,126 @@ func (tx *Transaction) Cost() *big.Int {
 func (tx *Transaction) RawSignatureValues() (v, r, s *big.Int) {
 	return tx.data.V, tx.data.R, tx.data.S
 }
+
+func (tx *Transaction) IsSpecialTransaction() bool {
+	if tx.To() == nil {
+		return false
+	}
+	return tx.To().String() == common.RandomizeSMC || tx.To().String() == common.BlockSigners
+}
+
+func (tx *Transaction) IsSigningTransaction() bool {
+	if tx.To() == nil {
+		return false
+	}
+
+	if tx.To().String() != common.BlockSigners {
+		return false
+	}
+
+	method := common.ToHex(tx.Data()[0:4])
+
+	if method != common.SignMethod {
+		return false
+	}
+
+	if len(tx.Data()) != (32*2 + 4) {
+		return false
+	}
+
+	return true
+}
+
+func (tx *Transaction) IsVotingTransaction() (bool, *common.Address) {
+	if tx.To() == nil {
+		return false, nil
+	}
+	b := (tx.To().String() == common.MasternodeVotingSMC)
+
+	if !b {
+		return b, nil
+	}
+
+	method := common.ToHex(tx.Data()[0:4])
+	if b = (method == common.VoteMethod); b {
+		addr := tx.Data()[len(tx.Data())-20:]
+		m := common.BytesToAddress(addr)
+		return b, &m
+	}
+
+	if b = (method == common.UnvoteMethod); b {
+		addr := tx.Data()[len(tx.Data())-32-20 : len(tx.Data())-32]
+		m := common.BytesToAddress(addr)
+		return b, &m
+	}
+
+	if b = (method == common.ProposeMethod); b {
+		addr := tx.Data()[len(tx.Data())-20:]
+		m := common.BytesToAddress(addr)
+		return b, &m
+	}
+
+	if b = (method == common.ResignMethod); b {
+		addr := tx.Data()[len(tx.Data())-20:]
+		m := common.BytesToAddress(addr)
+		return b, &m
+	}
+
+	return b, nil
+}
+
+// TODO: do later here
+// func (tx *Transaction) String() string {
+// 	var from, to string
+// 	if tx.data.V != nil {
+// 		// make a best guess about the signer and use that to derive
+// 		// the sender.
+// 		signer := deriveSigner(tx.data.V)
+// 		if f, err := Sender(signer, tx); err != nil { // derive but don't cache
+// 			from = "[invalid sender: invalid sig]"
+// 		} else {
+// 			from = fmt.Sprintf("%x", f[:])
+// 		}
+// 	} else {
+// 		from = "[invalid sender: nil V field]"
+// 	}
+
+// 	if tx.data.Recipient == nil {
+// 		to = "[contract creation]"
+// 	} else {
+// 		to = fmt.Sprintf("%x", tx.data.Recipient[:])
+// 	}
+// 	enc, _ := rlp.EncodeToBytes(&tx.data)
+// 	return fmt.Sprintf(`
+// 	TX(%x)
+// 	Contract: %v
+// 	From:     %s
+// 	To:       %s
+// 	Nonce:    %v
+// 	GasPrice: %#x
+// 	GasLimit  %#x
+// 	Value:    %#x
+// 	Data:     0x%x
+// 	V:        %#x
+// 	R:        %#x
+// 	S:        %#x
+// 	Hex:      %x
+// `,
+// 		tx.Hash(),
+// 		tx.data.Recipient == nil,
+// 		from,
+// 		to,
+// 		tx.data.AccountNonce,
+// 		tx.data.Price,
+// 		tx.data.GasLimit,
+// 		tx.data.Amount,
+// 		tx.data.Payload,
+// 		tx.data.V,
+// 		tx.data.R,
+// 		tx.data.S,
+// 		enc,
+// 	)
+// }
 
 // Transactions is a Transaction slice type for basic sorting.
 type Transactions []*Transaction
@@ -334,14 +481,40 @@ type TransactionsByPriceAndNonce struct {
 //
 // Note, the input map is reowned so the caller should not interact any more with
 // if after providing it to the constructor.
-func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions) *TransactionsByPriceAndNonce {
+
+// It also classifies special txs and normal txs
+func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, signers map[common.Address]struct{}) (*TransactionsByPriceAndNonce, Transactions) {
 	// Initialize a price based heap with the head transactions
-	heads := make(TxByPrice, 0, len(txs))
+	heads := TxByPrice{}
+	specialTxs := Transactions{}
 	for from, accTxs := range txs {
 		heads = append(heads, accTxs[0])
 		// Ensure the sender address is from the signer
 		acc, _ := Sender(signer, accTxs[0])
-		txs[acc] = accTxs[1:]
+		var normalTxs Transactions
+		lastSpecialTx := -1
+		if len(signers) > 0 {
+			if _, ok := signers[acc]; ok {
+				for i, tx := range accTxs {
+					if tx.IsSpecialTransaction() {
+						lastSpecialTx = i
+					}
+				}
+			}
+		}
+		if lastSpecialTx >= 0 {
+			for i := 0; i <= lastSpecialTx; i++ {
+				specialTxs = append(specialTxs, accTxs[i])
+			}
+			normalTxs = accTxs[lastSpecialTx+1:]
+		} else {
+			normalTxs = accTxs
+		}
+		if len(normalTxs) > 0 {
+			heads = append(heads, normalTxs[0])
+			// Ensure the sender address is from the signer
+			txs[from] = normalTxs[1:]
+		}
 		if from != acc {
 			delete(txs, from)
 		}
@@ -353,7 +526,7 @@ func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transa
 		txs:    txs,
 		heads:  heads,
 		signer: signer,
-	}
+	}, specialTxs
 }
 
 // Peek returns the next transaction by price.

@@ -76,7 +76,8 @@ type peer struct {
 	id string
 
 	*p2p.Peer
-	rw p2p.MsgReadWriter
+	rw     p2p.MsgReadWriter
+	pairRw p2p.MsgReadWriter
 
 	version  int         // Protocol version negotiated
 	syncDrop *time.Timer // Timed connection dropper if sync progress isn't validated in time
@@ -264,6 +265,9 @@ func (p *peer) SendNewBlock(block *types.Block, td *big.Int) error {
 	for p.knownBlocks.Cardinality() >= maxKnownBlocks {
 		p.knownBlocks.Pop()
 	}
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, NewBlockMsg, []interface{}{block, td})
+	}
 	return p2p.Send(p.rw, NewBlockMsg, []interface{}{block, td})
 }
 
@@ -284,29 +288,44 @@ func (p *peer) AsyncSendNewBlock(block *types.Block, td *big.Int) {
 
 // SendBlockHeaders sends a batch of block headers to the remote peer.
 func (p *peer) SendBlockHeaders(headers []*types.Header) error {
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, BlockHeadersMsg, headers)
+	}
 	return p2p.Send(p.rw, BlockHeadersMsg, headers)
 }
 
 // SendBlockBodies sends a batch of block contents to the remote peer.
 func (p *peer) SendBlockBodies(bodies []*blockBody) error {
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, BlockBodiesMsg, blockBodiesData(bodies))
+	}
 	return p2p.Send(p.rw, BlockBodiesMsg, blockBodiesData(bodies))
 }
 
 // SendBlockBodiesRLP sends a batch of block contents to the remote peer from
 // an already RLP encoded format.
 func (p *peer) SendBlockBodiesRLP(bodies []rlp.RawValue) error {
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, BlockBodiesMsg, bodies)
+	}
 	return p2p.Send(p.rw, BlockBodiesMsg, bodies)
 }
 
 // SendNodeDataRLP sends a batch of arbitrary internal data, corresponding to the
 // hashes requested.
 func (p *peer) SendNodeData(data [][]byte) error {
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, NodeDataMsg, data)
+	}
 	return p2p.Send(p.rw, NodeDataMsg, data)
 }
 
 // SendReceiptsRLP sends a batch of transaction receipts, corresponding to the
 // ones requested from an already RLP encoded format.
 func (p *peer) SendReceiptsRLP(receipts []rlp.RawValue) error {
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, ReceiptsMsg, receipts)
+	}
 	return p2p.Send(p.rw, ReceiptsMsg, receipts)
 }
 
@@ -314,6 +333,9 @@ func (p *peer) SendReceiptsRLP(receipts []rlp.RawValue) error {
 // single header. It is used solely by the fetcher.
 func (p *peer) RequestOneHeader(hash common.Hash) error {
 	p.Log().Debug("Fetching single header", "hash", hash)
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Hash: hash}, Amount: uint64(1), Skip: uint64(0), Reverse: false})
+	}
 	return p2p.Send(p.rw, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Hash: hash}, Amount: uint64(1), Skip: uint64(0), Reverse: false})
 }
 
@@ -321,6 +343,9 @@ func (p *peer) RequestOneHeader(hash common.Hash) error {
 // specified header query, based on the hash of an origin block.
 func (p *peer) RequestHeadersByHash(origin common.Hash, amount int, skip int, reverse bool) error {
 	p.Log().Debug("Fetching batch of headers", "count", amount, "fromhash", origin, "skip", skip, "reverse", reverse)
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Hash: origin}, Amount: uint64(amount), Skip: uint64(skip), Reverse: reverse})
+	}
 	return p2p.Send(p.rw, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Hash: origin}, Amount: uint64(amount), Skip: uint64(skip), Reverse: reverse})
 }
 
@@ -328,6 +353,9 @@ func (p *peer) RequestHeadersByHash(origin common.Hash, amount int, skip int, re
 // specified header query, based on the number of an origin block.
 func (p *peer) RequestHeadersByNumber(origin uint64, amount int, skip int, reverse bool) error {
 	p.Log().Debug("Fetching batch of headers", "count", amount, "fromnum", origin, "skip", skip, "reverse", reverse)
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Number: origin}, Amount: uint64(amount), Skip: uint64(skip), Reverse: reverse})
+	}
 	return p2p.Send(p.rw, GetBlockHeadersMsg, &getBlockHeadersData{Origin: hashOrNumber{Number: origin}, Amount: uint64(amount), Skip: uint64(skip), Reverse: reverse})
 }
 
@@ -335,6 +363,9 @@ func (p *peer) RequestHeadersByNumber(origin uint64, amount int, skip int, rever
 // specified.
 func (p *peer) RequestBodies(hashes []common.Hash) error {
 	p.Log().Debug("Fetching batch of block bodies", "count", len(hashes))
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, GetBlockBodiesMsg, hashes)
+	}
 	return p2p.Send(p.rw, GetBlockBodiesMsg, hashes)
 }
 
@@ -342,12 +373,18 @@ func (p *peer) RequestBodies(hashes []common.Hash) error {
 // data, corresponding to the specified hashes.
 func (p *peer) RequestNodeData(hashes []common.Hash) error {
 	p.Log().Debug("Fetching batch of state data", "count", len(hashes))
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, GetNodeDataMsg, hashes)
+	}
 	return p2p.Send(p.rw, GetNodeDataMsg, hashes)
 }
 
 // RequestReceipts fetches a batch of transaction receipts from a remote node.
 func (p *peer) RequestReceipts(hashes []common.Hash) error {
 	p.Log().Debug("Fetching batch of receipts", "count", len(hashes))
+	if p.pairRw != nil {
+		return p2p.Send(p.pairRw, GetReceiptsMsg, hashes)
+	}
 	return p2p.Send(p.rw, GetReceiptsMsg, hashes)
 }
 
@@ -445,8 +482,14 @@ func (ps *peerSet) Register(p *peer) error {
 	if ps.closed {
 		return errClosed
 	}
-	if _, ok := ps.peers[p.id]; ok {
-		return errAlreadyRegistered
+	if existPeer, ok := ps.peers[p.id]; ok {
+		if existPeer.pairRw != nil {
+			return errAlreadyRegistered
+		}
+		existPeer.PairPeer = p.Peer
+		existPeer.pairRw = p.rw
+		p.PairPeer = existPeer.Peer
+		return p2p.ErrAddPairPeer
 	}
 	ps.peers[p.id] = p
 	go p.broadcast()

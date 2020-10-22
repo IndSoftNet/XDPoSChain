@@ -192,6 +192,8 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 	blocks, receipts := make(types.Blocks, n), make([]types.Receipts, n)
 	chainreader := &fakeChainReader{config: config}
 	genblock := func(i int, parent *types.Block, statedb *state.StateDB) (*types.Block, types.Receipts) {
+		// TODO(karalabe): This is needed for XDPoS, which depends on multiple blocks.
+		// It's nonetheless ugly to spin up a blockchain here. Get rid of this somehow.
 		b := &BlockGen{i: i, chain: blocks, parent: parent, statedb: statedb, config: config, engine: engine}
 		b.header = makeHeader(chainreader, parent, statedb, b.engine)
 

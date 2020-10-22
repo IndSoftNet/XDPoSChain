@@ -34,7 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/fdlimit"
 	"github.com/ethereum/go-ethereum/consensus"
-	"github.com/ethereum/go-ethereum/consensus/clique"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -113,7 +113,21 @@ func NewApp(gitCommit, gitDate, usage string) *cli.App {
 // are the same for all commands.
 
 var (
+	// XDC flags.
+	RollbackFlag = cli.StringFlag{
+		Name:  "rollback",
+		Usage: "Rollback chain at hash",
+		Value: "",
+	}
 	// General settings
+	AnnounceTxsFlag = cli.BoolFlag{
+		Name:  "announce-txs",
+		Usage: "Always commit transactions",
+	}
+	StoreRewardFlag = cli.BoolFlag{
+		Name:  "store-reward",
+		Usage: "Store reward to file",
+	}
 	DataDirFlag = DirectoryFlag{
 		Name:  "datadir",
 		Usage: "Data directory for the databases and keystore",
@@ -138,12 +152,16 @@ var (
 	}
 	NetworkIdFlag = cli.Uint64Flag{
 		Name:  "networkid",
-		Usage: "Network identifier (integer, 1=Frontier, 2=Morden (disused), 3=Ropsten, 4=Rinkeby)",
+		Usage: "Network identifier (integer, 89=XDCchain)",
 		Value: eth.DefaultConfig.NetworkId,
 	}
 	TestnetFlag = cli.BoolFlag{
 		Name:  "testnet",
 		Usage: "Ropsten network: pre-configured proof-of-work test network",
+	}
+	XDCTestnetFlag = cli.BoolFlag{
+		Name:  "XDC-testnet",
+		Usage: "XDC test network",
 	}
 	RinkebyFlag = cli.BoolFlag{
 		Name:  "rinkeby",
@@ -384,73 +402,73 @@ var (
 		Usage: "Disable heuristic state prefetch during block import (less CPU and disk IO, more time waiting for data)",
 	}
 	// Miner settings
-	MiningEnabledFlag = cli.BoolFlag{
+	StakingEnabledFlag = cli.BoolFlag{
 		Name:  "mine",
-		Usage: "Enable mining",
+		Usage: "Enable staking",
 	}
-	MinerThreadsFlag = cli.IntFlag{
+	StakerThreadsFlag = cli.IntFlag{
 		Name:  "miner.threads",
 		Usage: "Number of CPU threads to use for mining",
 		Value: 0,
 	}
-	MinerLegacyThreadsFlag = cli.IntFlag{
+	StakerLegacyThreadsFlag = cli.IntFlag{
 		Name:  "minerthreads",
 		Usage: "Number of CPU threads to use for mining (deprecated, use --miner.threads)",
 		Value: 0,
 	}
-	MinerNotifyFlag = cli.StringFlag{
+	StakerNotifyFlag = cli.StringFlag{
 		Name:  "miner.notify",
 		Usage: "Comma separated HTTP URL list to notify of new work packages",
 	}
-	MinerGasTargetFlag = cli.Uint64Flag{
+	StakerGasTargetFlag = cli.Uint64Flag{
 		Name:  "miner.gastarget",
 		Usage: "Target gas floor for mined blocks",
 		Value: eth.DefaultConfig.Miner.GasFloor,
 	}
-	MinerLegacyGasTargetFlag = cli.Uint64Flag{
+	StakerLegacyGasTargetFlag = cli.Uint64Flag{
 		Name:  "targetgaslimit",
 		Usage: "Target gas floor for mined blocks (deprecated, use --miner.gastarget)",
 		Value: eth.DefaultConfig.Miner.GasFloor,
 	}
-	MinerGasLimitFlag = cli.Uint64Flag{
+	StakerGasLimitFlag = cli.Uint64Flag{
 		Name:  "miner.gaslimit",
 		Usage: "Target gas ceiling for mined blocks",
 		Value: eth.DefaultConfig.Miner.GasCeil,
 	}
-	MinerGasPriceFlag = BigFlag{
+	StakerGasPriceFlag = BigFlag{
 		Name:  "miner.gasprice",
 		Usage: "Minimum gas price for mining a transaction",
 		Value: eth.DefaultConfig.Miner.GasPrice,
 	}
-	MinerLegacyGasPriceFlag = BigFlag{
+	StakerLegacyGasPriceFlag = BigFlag{
 		Name:  "gasprice",
 		Usage: "Minimum gas price for mining a transaction (deprecated, use --miner.gasprice)",
 		Value: eth.DefaultConfig.Miner.GasPrice,
 	}
-	MinerEtherbaseFlag = cli.StringFlag{
+	StakerEtherbaseFlag = cli.StringFlag{
 		Name:  "miner.etherbase",
 		Usage: "Public address for block mining rewards (default = first account)",
 		Value: "0",
 	}
-	MinerLegacyEtherbaseFlag = cli.StringFlag{
+	StakerLegacyEtherbaseFlag = cli.StringFlag{
 		Name:  "etherbase",
 		Usage: "Public address for block mining rewards (default = first account, deprecated, use --miner.etherbase)",
 		Value: "0",
 	}
-	MinerExtraDataFlag = cli.StringFlag{
+	StakerExtraDataFlag = cli.StringFlag{
 		Name:  "miner.extradata",
 		Usage: "Block extra data set by the miner (default = client version)",
 	}
-	MinerLegacyExtraDataFlag = cli.StringFlag{
+	StakerLegacyExtraDataFlag = cli.StringFlag{
 		Name:  "extradata",
 		Usage: "Block extra data set by the miner (default = client version, deprecated, use --miner.extradata)",
 	}
-	MinerRecommitIntervalFlag = cli.DurationFlag{
+	StakerRecommitIntervalFlag = cli.DurationFlag{
 		Name:  "miner.recommit",
 		Usage: "Time interval to recreate the block being mined",
 		Value: eth.DefaultConfig.Miner.Recommit,
 	}
-	MinerNoVerfiyFlag = cli.BoolFlag{
+	StakerNoVerfiyFlag = cli.BoolFlag{
 		Name:  "miner.noverify",
 		Usage: "Disable remote sealing verification",
 	}
@@ -795,7 +813,7 @@ func setNodeUserIdent(ctx *cli.Context, cfg *node.Config) {
 // setBootstrapNodes creates a list of bootstrap nodes from the command line
 // flags, reverting to pre-configured ones if none have been specified.
 func setBootstrapNodes(ctx *cli.Context, cfg *p2p.Config) {
-	urls := params.MainnetBootnodes
+	urls := []string{}
 	switch {
 	case ctx.GlobalIsSet(BootnodesFlag.Name) || ctx.GlobalIsSet(BootnodesV4Flag.Name):
 		if ctx.GlobalIsSet(BootnodesV4Flag.Name) {
@@ -869,6 +887,7 @@ func setListenAddress(ctx *cli.Context, cfg *p2p.Config) {
 // setNAT creates a port mapper from command line flags.
 func setNAT(ctx *cli.Context, cfg *p2p.Config) {
 	if ctx.GlobalIsSet(NATFlag.Name) {
+		log.Info("NAT is setted", "value", ctx.GlobalString(NATFlag.Name))
 		natif, err := nat.Parse(ctx.GlobalString(NATFlag.Name))
 		if err != nil {
 			Fatalf("Option %s: %v", NATFlag.Name, err)
@@ -960,6 +979,7 @@ func setIPC(ctx *cli.Context, cfg *node.Config) {
 	}
 }
 
+// TODO: Do later here
 // setLes configures the les server and ultra light client settings from the command line flags.
 func setLes(ctx *cli.Context, cfg *eth.Config) {
 	if ctx.GlobalIsSet(LightLegacyServFlag.Name) {
@@ -995,9 +1015,9 @@ func setLes(ctx *cli.Context, cfg *eth.Config) {
 	}
 }
 
-// makeDatabaseHandles raises out the number of allowed file handles per process
-// for Geth and returns half of the allowance to assign to the database.
-func makeDatabaseHandles() int {
+// MakeDatabaseHandles raises out the number of allowed file handles per process
+// for XDC and returns half of the allowance to assign to the database.
+func MakeDatabaseHandles() int {
 	limit, err := fdlimit.Maximum()
 	if err != nil {
 		Fatalf("Failed to retrieve file descriptor allowance: %v", err)
@@ -1024,7 +1044,7 @@ func MakeAddress(ks *keystore.KeyStore, account string) (accounts.Account, error
 	log.Warn("-------------------------------------------------------------------")
 	log.Warn("Referring to accounts by order in the keystore folder is dangerous!")
 	log.Warn("This functionality is deprecated and will be removed in the future!")
-	log.Warn("Please use explicit addresses! (can search via `geth account list`)")
+	log.Warn("Please use explicit addresses! (can search via `XDC account list`)")
 	log.Warn("-------------------------------------------------------------------")
 
 	accs := ks.Accounts()
@@ -1039,11 +1059,11 @@ func MakeAddress(ks *keystore.KeyStore, account string) (accounts.Account, error
 func setEtherbase(ctx *cli.Context, ks *keystore.KeyStore, cfg *eth.Config) {
 	// Extract the current etherbase, new flag overriding legacy one
 	var etherbase string
-	if ctx.GlobalIsSet(MinerLegacyEtherbaseFlag.Name) {
-		etherbase = ctx.GlobalString(MinerLegacyEtherbaseFlag.Name)
+	if ctx.GlobalIsSet(StakerLegacyEtherbaseFlag.Name) {
+		etherbase = ctx.GlobalString(StakerLegacyEtherbaseFlag.Name)
 	}
-	if ctx.GlobalIsSet(MinerEtherbaseFlag.Name) {
-		etherbase = ctx.GlobalString(MinerEtherbaseFlag.Name)
+	if ctx.GlobalIsSet(StakerEtherbaseFlag.Name) {
+		etherbase = ctx.GlobalString(StakerEtherbaseFlag.Name)
 	}
 	// Convert the etherbase into an address and configure it
 	if etherbase != "" {
@@ -1147,6 +1167,7 @@ func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 	}
 }
 
+// TODO: do later here
 // SetNodeConfig applies node-related command line flags to the config.
 func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	SetP2PConfig(ctx, &cfg.P2P)
@@ -1171,11 +1192,16 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	if ctx.GlobalIsSet(NoUSBFlag.Name) {
 		cfg.NoUSB = ctx.GlobalBool(NoUSBFlag.Name)
 	}
+	if ctx.GlobalIsSet(AnnounceTxsFlag.Name) {
+		cfg.AnnounceTxs = ctx.GlobalBool(AnnounceTxsFlag.Name)
+	}
 	if ctx.GlobalIsSet(InsecureUnlockAllowedFlag.Name) {
 		cfg.InsecureUnlockAllowed = ctx.GlobalBool(InsecureUnlockAllowedFlag.Name)
 	}
 }
 
+// TODO: do later here
+// it may be comment or remove because flag not exists
 func setSmartCard(ctx *cli.Context, cfg *node.Config) {
 	// Skip enabling smartcards if no path is set
 	path := ctx.GlobalString(SmartCardDaemonPathFlag.Name)
@@ -1196,6 +1222,8 @@ func setSmartCard(ctx *cli.Context, cfg *node.Config) {
 	cfg.SmartCardDaemonPath = path
 }
 
+// TODO: do later here
+// it may be comment or remove because flag not exists
 func setDataDir(ctx *cli.Context, cfg *node.Config) {
 	switch {
 	case ctx.GlobalIsSet(DataDirFlag.Name):
@@ -1285,35 +1313,35 @@ func setEthash(ctx *cli.Context, cfg *eth.Config) {
 }
 
 func setMiner(ctx *cli.Context, cfg *miner.Config) {
-	if ctx.GlobalIsSet(MinerNotifyFlag.Name) {
-		cfg.Notify = strings.Split(ctx.GlobalString(MinerNotifyFlag.Name), ",")
+	if ctx.GlobalIsSet(StakerNotifyFlag.Name) {
+		cfg.Notify = strings.Split(ctx.GlobalString(StakerNotifyFlag.Name), ",")
 	}
-	if ctx.GlobalIsSet(MinerLegacyExtraDataFlag.Name) {
-		cfg.ExtraData = []byte(ctx.GlobalString(MinerLegacyExtraDataFlag.Name))
+	if ctx.GlobalIsSet(StakerLegacyExtraDataFlag.Name) {
+		cfg.ExtraData = []byte(ctx.GlobalString(StakerLegacyExtraDataFlag.Name))
 	}
-	if ctx.GlobalIsSet(MinerExtraDataFlag.Name) {
-		cfg.ExtraData = []byte(ctx.GlobalString(MinerExtraDataFlag.Name))
+	if ctx.GlobalIsSet(StakerExtraDataFlag.Name) {
+		cfg.ExtraData = []byte(ctx.GlobalString(StakerExtraDataFlag.Name))
 	}
-	if ctx.GlobalIsSet(MinerLegacyGasTargetFlag.Name) {
-		cfg.GasFloor = ctx.GlobalUint64(MinerLegacyGasTargetFlag.Name)
+	if ctx.GlobalIsSet(StakerLegacyGasTargetFlag.Name) {
+		cfg.GasFloor = ctx.GlobalUint64(StakerLegacyGasTargetFlag.Name)
 	}
-	if ctx.GlobalIsSet(MinerGasTargetFlag.Name) {
-		cfg.GasFloor = ctx.GlobalUint64(MinerGasTargetFlag.Name)
+	if ctx.GlobalIsSet(StakerGasTargetFlag.Name) {
+		cfg.GasFloor = ctx.GlobalUint64(StakerGasTargetFlag.Name)
 	}
-	if ctx.GlobalIsSet(MinerGasLimitFlag.Name) {
-		cfg.GasCeil = ctx.GlobalUint64(MinerGasLimitFlag.Name)
+	if ctx.GlobalIsSet(StakerGasLimitFlag.Name) {
+		cfg.GasCeil = ctx.GlobalUint64(StakerGasLimitFlag.Name)
 	}
-	if ctx.GlobalIsSet(MinerLegacyGasPriceFlag.Name) {
-		cfg.GasPrice = GlobalBig(ctx, MinerLegacyGasPriceFlag.Name)
+	if ctx.GlobalIsSet(StakerLegacyGasPriceFlag.Name) {
+		cfg.GasPrice = GlobalBig(ctx, StakerLegacyGasPriceFlag.Name)
 	}
-	if ctx.GlobalIsSet(MinerGasPriceFlag.Name) {
-		cfg.GasPrice = GlobalBig(ctx, MinerGasPriceFlag.Name)
+	if ctx.GlobalIsSet(StakerGasPriceFlag.Name) {
+		cfg.GasPrice = GlobalBig(ctx, StakerGasPriceFlag.Name)
 	}
-	if ctx.GlobalIsSet(MinerRecommitIntervalFlag.Name) {
-		cfg.Recommit = ctx.Duration(MinerRecommitIntervalFlag.Name)
+	if ctx.GlobalIsSet(StakerRecommitIntervalFlag.Name) {
+		cfg.Recommit = ctx.Duration(StakerRecommitIntervalFlag.Name)
 	}
-	if ctx.GlobalIsSet(MinerNoVerfiyFlag.Name) {
-		cfg.Noverify = ctx.Bool(MinerNoVerfiyFlag.Name)
+	if ctx.GlobalIsSet(StakerNoVerfiyFlag.Name) {
+		cfg.Noverify = ctx.Bool(StakerNoVerfiyFlag.Name)
 	}
 }
 
@@ -1422,7 +1450,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 	if ctx.GlobalIsSet(CacheFlag.Name) || ctx.GlobalIsSet(CacheDatabaseFlag.Name) {
 		cfg.DatabaseCache = ctx.GlobalInt(CacheFlag.Name) * ctx.GlobalInt(CacheDatabaseFlag.Name) / 100
 	}
-	cfg.DatabaseHandles = makeDatabaseHandles()
+	cfg.DatabaseHandles = MakeDatabaseHandles()
 	if ctx.GlobalIsSet(AncientFlag.Name) {
 		cfg.DatabaseFreezer = ctx.GlobalString(AncientFlag.Name)
 	}
@@ -1436,6 +1464,11 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 	if ctx.GlobalIsSet(CacheFlag.Name) || ctx.GlobalIsSet(CacheTrieFlag.Name) {
 		cfg.TrieCleanCache = ctx.GlobalInt(CacheFlag.Name) * ctx.GlobalInt(CacheTrieFlag.Name) / 100
 	}
+	// if ctx.GlobalIsSet(StakerThreadsFlag.Name) {
+	// 	cfg.MinerThreads = ctx.GlobalInt(StakerThreadsFlag.Name)
+	// }
+	// TODO: do later here
+	// it may be comment or remove because the flag not exitsts
 	if ctx.GlobalIsSet(CacheFlag.Name) || ctx.GlobalIsSet(CacheGCFlag.Name) {
 		cfg.TrieDirtyCache = ctx.GlobalInt(CacheFlag.Name) * ctx.GlobalInt(CacheGCFlag.Name) / 100
 	}
@@ -1446,7 +1479,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 		// TODO(fjl): force-enable this in --dev mode
 		cfg.EnablePreimageRecording = ctx.GlobalBool(VMEnableDebugFlag.Name)
 	}
+	if ctx.GlobalIsSet(StoreRewardFlag.Name) {
+		common.StoreRewardFolder = filepath.Join(stack.DataDir(), "XDC", "rewards")
+		if _, err := os.Stat(common.StoreRewardFolder); os.IsNotExist(err) {
+			os.Mkdir(common.StoreRewardFolder, os.ModePerm)
+		}
+	}
 
+	// TODO: do later here
+	// it may be comment or remove because the flag not extists
 	if ctx.GlobalIsSet(EWASMInterpreterFlag.Name) {
 		cfg.EWASMInterpreter = ctx.GlobalString(EWASMInterpreterFlag.Name)
 	}
@@ -1470,11 +1511,11 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 			cfg.NetworkId = 4
 		}
 		cfg.Genesis = core.DefaultRinkebyGenesisBlock()
-	case ctx.GlobalBool(GoerliFlag.Name):
-		if !ctx.GlobalIsSet(NetworkIdFlag.Name) {
-			cfg.NetworkId = 5
-		}
-		cfg.Genesis = core.DefaultGoerliGenesisBlock()
+	// case ctx.GlobalBool(GoerliFlag.Name):
+	// 	if !ctx.GlobalIsSet(NetworkIdFlag.Name) {
+	// 		cfg.NetworkId = 5
+	// 	}
+	// 	cfg.Genesis = core.DefaultGoerliGenesisBlock()
 	case ctx.GlobalBool(DeveloperFlag.Name):
 		if !ctx.GlobalIsSet(NetworkIdFlag.Name) {
 			cfg.NetworkId = 1337
@@ -1498,7 +1539,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 		log.Info("Using developer account", "address", developer.Address)
 
 		cfg.Genesis = core.DeveloperGenesisBlock(uint64(ctx.GlobalInt(DeveloperPeriodFlag.Name)), developer.Address)
-		if !ctx.GlobalIsSet(MinerGasPriceFlag.Name) && !ctx.GlobalIsSet(MinerLegacyGasPriceFlag.Name) {
+		if !ctx.GlobalIsSet(StakerGasPriceFlag.Name) && !ctx.GlobalIsSet(StakerLegacyGasPriceFlag.Name) {
 			cfg.Miner.GasPrice = big.NewInt(1)
 		}
 	}
@@ -1629,7 +1670,7 @@ func SplitTagsFlag(tagsFlag string) map[string]string {
 func MakeChainDatabase(ctx *cli.Context, stack *node.Node) ethdb.Database {
 	var (
 		cache   = ctx.GlobalInt(CacheFlag.Name) * ctx.GlobalInt(CacheDatabaseFlag.Name) / 100
-		handles = makeDatabaseHandles()
+		handles = MakeDatabaseHandles()
 	)
 	name := "chaindata"
 	if ctx.GlobalString(SyncModeFlag.Name) == "light" {
@@ -1649,8 +1690,8 @@ func MakeGenesis(ctx *cli.Context) *core.Genesis {
 		genesis = core.DefaultTestnetGenesisBlock()
 	case ctx.GlobalBool(RinkebyFlag.Name):
 		genesis = core.DefaultRinkebyGenesisBlock()
-	case ctx.GlobalBool(GoerliFlag.Name):
-		genesis = core.DefaultGoerliGenesisBlock()
+	// case ctx.GlobalBool(GoerliFlag.Name):
+	// 	genesis = core.DefaultGoerliGenesisBlock()
 	case ctx.GlobalBool(DeveloperFlag.Name):
 		Fatalf("Developer chains are ephemeral")
 	}
@@ -1666,8 +1707,8 @@ func MakeChain(ctx *cli.Context, stack *node.Node) (chain *core.BlockChain, chai
 		Fatalf("%v", err)
 	}
 	var engine consensus.Engine
-	if config.Clique != nil {
-		engine = clique.New(config.Clique, chainDb)
+	if config.XDPoS != nil {
+		engine = XDPoS.New(config.XDPoS, chainDb)
 	} else {
 		engine = ethash.NewFaker()
 		if !ctx.GlobalBool(FakePoWFlag.Name) {
@@ -1680,6 +1721,7 @@ func MakeChain(ctx *cli.Context, stack *node.Node) (chain *core.BlockChain, chai
 				DatasetsOnDisk: eth.DefaultConfig.Ethash.DatasetsOnDisk,
 			}, nil, false)
 		}
+		Fatalf("Only support XDPoS consensus")
 	}
 	if gcmode := ctx.GlobalString(GCModeFlag.Name); gcmode != "full" && gcmode != "archive" {
 		Fatalf("--%s must be either 'full' or 'archive'", GCModeFlag.Name)
@@ -1726,11 +1768,11 @@ func MakeConsolePreloads(ctx *cli.Context) []string {
 // This is a temporary function used for migrating old command/flags to the
 // new format.
 //
-// e.g. geth account new --keystore /tmp/mykeystore --lightkdf
+// e.g. XDC account new --keystore /tmp/mykeystore --lightkdf
 //
 // is equivalent after calling this method with:
 //
-// geth --keystore /tmp/mykeystore --lightkdf account new
+// XDC --keystore /tmp/mykeystore --lightkdf account new
 //
 // This allows the use of the existing configuration functionality.
 // When all flags are migrated this function can be removed and the existing

@@ -18,8 +18,10 @@ package miner
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"math/big"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,7 +29,9 @@ import (
 	mapset "github.com/deckarep/golang-set"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/misc"
+	"github.com/ethereum/go-ethereum/contracts"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -74,6 +78,12 @@ const (
 
 	// staleThreshold is the maximum depth of the acceptable stale block.
 	staleThreshold = 7
+
+	// timeout waiting for M1
+	waitPeriod = 10
+
+	// timeout for checkpoint.
+	waitPeriodCheckpoint = 20
 )
 
 // environment is the worker's current environment and holds all of the current state information.
@@ -166,6 +176,9 @@ type worker struct {
 	running int32 // The indicator whether the consensus engine is running or not.
 	newTxs  int32 // New arrival transaction count since last sealing work submitting.
 
+	announceTxs           bool
+	lastParentBlockCommit string
+
 	// External functions
 	isLocalBlock func(block *types.Block) bool // Function used to determine whether the specified block is mined by local miner.
 
@@ -176,7 +189,7 @@ type worker struct {
 	resubmitHook func(time.Duration, time.Duration) // Method to call upon updating resubmitting interval.
 }
 
-func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, isLocalBlock func(*types.Block) bool) *worker {
+func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, isLocalBlock func(*types.Block) bool, announceTxs bool) *worker {
 	worker := &worker{
 		config:             config,
 		chainConfig:        chainConfig,
@@ -199,9 +212,13 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		startCh:            make(chan struct{}, 1),
 		resubmitIntervalCh: make(chan time.Duration),
 		resubmitAdjustCh:   make(chan *intervalAdjust, resubmitAdjustChanSize),
+		announceTxs:        announceTxs,
 	}
-	// Subscribe NewTxsEvent for tx pool
-	worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
+
+	if worker.announceTxs {
+		// Subscribe NewTxsEvent for tx pool
+		worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
+	}
 	// Subscribe events for blockchain
 	worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh)
 	worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh)
@@ -352,7 +369,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 		case <-timer.C:
 			// If mining is running resubmit a new work cycle periodically to pull in
 			// higher priced transactions. Disable this overhead for pending blocks.
-			if w.isRunning() && (w.chainConfig.Clique == nil || w.chainConfig.Clique.Period > 0) {
+			if w.isRunning() && (w.chainConfig.XDPoS == nil || w.chainConfig.XDPoS.Period > 0) {
 				// Short circuit if no new transaction arrives.
 				if atomic.LoadInt32(&w.newTxs) == 0 {
 					timer.Reset(recommit)
@@ -398,51 +415,80 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 
 // mainLoop is a standalone goroutine to regenerate the sealing task based on the received event.
 func (w *worker) mainLoop() {
-	defer w.txsSub.Unsubscribe()
+	if w.announceTxs {
+		defer w.txsSub.Unsubscribe()
+	}
 	defer w.chainHeadSub.Unsubscribe()
 	defer w.chainSideSub.Unsubscribe()
+
+	// XDPoS
+	timeout := time.NewTimer(waitPeriod * time.Second)
+	c := make(chan struct{})
+	finish := make(chan struct{})
+	defer close(finish)
+	defer timeout.Stop()
+	go func() {
+		for {
+			// A real event arrived, process interesting content
+			select {
+			case <-timeout.C:
+				c <- struct{}{}
+			case <-finish:
+				return
+			}
+		}
+	}()
 
 	for {
 		select {
 		case req := <-w.newWorkCh:
 			w.commitNewWork(req.interrupt, req.noempty, req.timestamp)
-
+			timeout.Reset(waitPeriod * time.Second)
+		case <-c:
+			if w.isRunning() {
+				// TODO: do later here
+				w.commitNewWork(nil, true, time.Now().Unix())
+			}
+			timeout.Reset(waitPeriod * time.Second)
 		case ev := <-w.chainSideCh:
-			// Short circuit for duplicate side blocks
-			if _, exist := w.localUncles[ev.Block.Hash()]; exist {
-				continue
-			}
-			if _, exist := w.remoteUncles[ev.Block.Hash()]; exist {
-				continue
-			}
-			// Add side block to possible uncle block set depending on the author.
-			if w.isLocalBlock != nil && w.isLocalBlock(ev.Block) {
-				w.localUncles[ev.Block.Hash()] = ev.Block
-			} else {
-				w.remoteUncles[ev.Block.Hash()] = ev.Block
-			}
-			// If our mining block contains less than 2 uncle blocks,
-			// add the new uncle block if valid and regenerate a mining block.
-			if w.isRunning() && w.current != nil && w.current.uncles.Cardinality() < 2 {
-				start := time.Now()
-				if err := w.commitUncle(w.current, ev.Block.Header()); err == nil {
-					var uncles []*types.Header
-					w.current.uncles.Each(func(item interface{}) bool {
-						hash, ok := item.(common.Hash)
-						if !ok {
+			// network is not XDC
+			if w.chainConfig.XDPoS == nil {
+				// Short circuit for duplicate side blocks
+				if _, exist := w.localUncles[ev.Block.Hash()]; exist {
+					continue
+				}
+				if _, exist := w.remoteUncles[ev.Block.Hash()]; exist {
+					continue
+				}
+				// Add side block to possible uncle block set depending on the author.
+				if w.isLocalBlock != nil && w.isLocalBlock(ev.Block) {
+					w.localUncles[ev.Block.Hash()] = ev.Block
+				} else {
+					w.remoteUncles[ev.Block.Hash()] = ev.Block
+				}
+				// If our mining block contains less than 2 uncle blocks,
+				// add the new uncle block if valid and regenerate a mining block.
+				if w.isRunning() && w.current != nil && w.current.uncles.Cardinality() < 2 {
+					start := time.Now()
+					if err := w.commitUncle(w.current, ev.Block.Header()); err == nil {
+						var uncles []*types.Header
+						w.current.uncles.Each(func(item interface{}) bool {
+							hash, ok := item.(common.Hash)
+							if !ok {
+								return false
+							}
+							uncle, exist := w.localUncles[hash]
+							if !exist {
+								uncle, exist = w.remoteUncles[hash]
+							}
+							if !exist {
+								return false
+							}
+							uncles = append(uncles, uncle.Header())
 							return false
-						}
-						uncle, exist := w.localUncles[hash]
-						if !exist {
-							uncle, exist = w.remoteUncles[hash]
-						}
-						if !exist {
-							return false
-						}
-						uncles = append(uncles, uncle.Header())
-						return false
-					})
-					w.commit(uncles, nil, true, start)
+						})
+						w.commit(uncles, nil, true, start)
+					}
 				}
 			}
 
@@ -466,18 +512,18 @@ func (w *worker) mainLoop() {
 					acc, _ := types.Sender(w.current.signer, tx)
 					txs[acc] = append(txs[acc], tx)
 				}
-				txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs)
+				txset, specialTxs := types.NewTransactionsByPriceAndNonce(w.current.signer, txs, nil)
 				tcount := w.current.tcount
-				w.commitTransactions(txset, coinbase, nil)
+				w.commitTransactions(txset, specialTxs, coinbase, nil)
 				// Only update the snapshot if any new transactons were added
 				// to the pending block
 				if tcount != w.current.tcount {
 					w.updateSnapshot()
 				}
 			} else {
-				// If clique is running in dev mode(period is 0), disable
+				// If XDPoS is running in dev mode(period is 0), disable
 				// advance sealing here.
-				if w.chainConfig.Clique != nil && w.chainConfig.Clique.Period == 0 {
+				if w.chainConfig.XDPoS != nil && w.chainConfig.XDPoS.Period == 0 {
 					w.commitNewWork(nil, true, time.Now().Unix())
 				}
 			}
@@ -485,9 +531,12 @@ func (w *worker) mainLoop() {
 
 		// System stopped
 		case <-w.exitCh:
+			// fmt.Println("<-w .exitCh")
 			return
-		case <-w.txsSub.Err():
-			return
+		// TODO: do later here
+		// case <-w.txsSub.Err():
+		// 	fmt.Println("<-w.txsSub.Err()")
+		// 	return
 		case <-w.chainHeadSub.Err():
 			return
 		case <-w.chainSideSub.Err():
@@ -496,6 +545,7 @@ func (w *worker) mainLoop() {
 	}
 }
 
+// TODO: do later here
 // taskLoop is a standalone goroutine to fetch sealing task from the generator and
 // push them to consensus engine.
 func (w *worker) taskLoop() {
@@ -557,6 +607,10 @@ func (w *worker) resultLoop() {
 			if w.chain.HasBlock(block.Hash(), block.NumberU64()) {
 				continue
 			}
+			if w.chainConfig.XDPoS != nil && block.NumberU64() >= w.chainConfig.XDPoS.Epoch && len(block.Validator()) == 0 {
+				w.mux.Post(core.NewMinedBlockEvent{Block: block})
+				continue
+			}
 			var (
 				sealhash = w.engine.SealHash(block.Header())
 				hash     = block.Hash()
@@ -608,10 +662,54 @@ func (w *worker) resultLoop() {
 			case core.SideStatTy:
 				events = append(events, core.ChainSideEvent{Block: block})
 			}
+
+			if w.chainConfig.XDPoS != nil {
+				// epoch block
+				if (block.NumberU64() % w.chainConfig.XDPoS.Epoch) == 0 {
+					core.CheckpointCh <- 1
+				}
+				// prepare set of masternodes for the next epoch
+				if (block.NumberU64() % w.chainConfig.XDPoS.Epoch) == (w.chainConfig.XDPoS.Epoch - w.chainConfig.XDPoS.Gap) {
+					err := w.chain.UpdateM1()
+					if err != nil {
+						log.Error("Error when update masternodes set. Stopping node", "err", err)
+						os.Exit(1)
+					}
+				}
+			}
 			w.chain.PostChainEvents(events, logs)
 
 			// Insert the block into the set of pending ones to resultLoop for confirmations
 			w.unconfirmed.Insert(block.NumberU64(), block.Hash())
+
+			if w.chainConfig.XDPoS != nil {
+				c := w.engine.(*XDPoS.XDPoS)
+				snap, err := c.GetSnapshot(w.chain, block.Header())
+				if err != nil {
+					log.Error("Fail to get snapshot for sign tx signer.")
+					return
+				}
+				if _, authorized := snap.Signers[w.coinbase]; !authorized {
+					valid := false
+					masternodes := c.GetMasternodes(w.chain, block.Header())
+					for _, m := range masternodes {
+						if m == w.coinbase {
+							valid = true
+							break
+						}
+					}
+					if !valid {
+						log.Error("Coinbase address not in snapshot signers.")
+						return
+					}
+				}
+				// Send tx sign to smart contract blockSigners.
+				if block.NumberU64()%common.MergeSignRange == 0 || w.chainConfig.IsTIP2019(block.Number()) {
+					if err := contracts.CreateTransactionSign(w.chainConfig, w.eth.TxPool(), w.eth.AccountManager(), block, w.eth.ChainDb()); err != nil {
+						log.Error("Fail to create tx sign for signer", "error", "err")
+					}
+				}
+			}
 
 		case <-w.exitCh:
 			return
@@ -634,19 +732,28 @@ func (w *worker) makeCurrent(parent *types.Block, header *types.Header) error {
 		header:    header,
 	}
 
-	// when 08 is processed ancestors contain 07 (quick block)
-	for _, ancestor := range w.chain.GetBlocksFromHash(parent.Hash(), 7) {
-		for _, uncle := range ancestor.Uncles() {
-			env.family.Add(uncle.Hash())
+	if w.chainConfig.XDPoS == nil {
+		// when 08 is processed ancestors contain 07 (quick block)
+		for _, ancestor := range w.chain.GetBlocksFromHash(parent.Hash(), 7) {
+			for _, uncle := range ancestor.Uncles() {
+				env.family.Add(uncle.Hash())
+			}
+			env.family.Add(ancestor.Hash())
+			env.ancestors.Add(ancestor.Hash())
 		}
-		env.family.Add(ancestor.Hash())
-		env.ancestors.Add(ancestor.Hash())
 	}
-
 	// Keep track of transactions which return errors so they can be removed
 	env.tcount = 0
 	w.current = env
+
 	return nil
+}
+
+func abs(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // commitUncle adds the given block to uncle block set, returns error if failed to add.
@@ -715,7 +822,7 @@ func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Addres
 	return receipt.Logs, nil
 }
 
-func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coinbase common.Address, interrupt *int32) bool {
+func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, specialTxs types.Transactions, coinbase common.Address, interrupt *int32) bool {
 	// Short circuit if current is nil
 	if w.current == nil {
 		return true
@@ -726,7 +833,72 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 	}
 
 	var coalescedLogs []*types.Log
+	// first priority for special Txs
+	for _, tx := range specialTxs {
+		if gp := w.current.gasPool; gp != nil && gp.Gas() < params.TxGas && tx.Gas() > 0 {
+			log.Trace("Not enough gas for further transactions", "gp", gp)
+			break
+		}
+		// Error may be ignored here. The error has already been checked
+		// during transaction acceptance is the transaction pool.
+		//
+		// We use the eip155 signer regardless of the current hf.
+		env := w.current
+		from, _ := types.Sender(env.signer, tx)
+		// Check whether the tx is replay protected. If we're not in the EIP155 hf
+		// phase, start ignoring the sender until we do.
+		if tx.Protected() && !w.chainConfig.IsEIP155(env.header.Number) {
+			log.Trace("Ignoring reply protected special transaction", "hash", tx.Hash(), "eip155", w.chainConfig.EIP155Block)
+			continue
+		}
+		if tx.To().Hex() == common.BlockSigners {
+			if len(tx.Data()) < 68 {
+				log.Trace("Data special transaction invalid length", "hash", tx.Hash(), "data", len(tx.Data()))
+				continue
+			}
+			blkNumber := binary.BigEndian.Uint64(tx.Data()[8:40])
+			if blkNumber >= env.header.Number.Uint64() || blkNumber <= env.header.Number.Uint64()-w.chainConfig.XDPoS.Epoch*2 {
+				log.Trace("Data special transaction invalid number", "hash", tx.Hash(), "blkNumber", blkNumber, "miner", env.header.Number)
+				continue
+			}
+		}
+		// Start executing the transaction
+		env.state.Prepare(tx.Hash(), common.Hash{}, env.tcount)
+		nonce := env.state.GetNonce(from)
+		if nonce != tx.Nonce() {
+			log.Trace("Skipping account with special transaction invalide nonce", "sender", from, "nonce", nonce, "tx nonce ", tx.Nonce(), "to", tx.To())
+			continue
+		}
+		logs, err := w.commitTransaction(tx, coinbase)
+		switch err {
+		case core.ErrGasLimitReached:
+			// Pop the current out-of-gas transaction without shifting in the next from the account
+			log.Trace("Gas limit exceeded for current block", "sender", from)
+			txs.Pop()
 
+		case core.ErrNonceTooLow:
+			// New head notification data race between the transaction pool and miner, shift
+			log.Trace("Skipping special transaction with low nonce", "sender", from, "nonce", tx.Nonce(), "to", tx.To())
+			txs.Shift()
+
+		case core.ErrNonceTooHigh:
+			// Reorg notification data race between the transaction pool and miner, skip account =
+			log.Trace("Skipping account with special transaction hight nonce", "sender", from, "nonce", tx.Nonce(), "to", tx.To())
+			txs.Pop()
+
+		case nil:
+			// Everything ok, collect the logs and shift in the next transaction from the same account
+			coalescedLogs = append(coalescedLogs, logs...)
+			env.tcount++
+			txs.Shift()
+
+		default:
+			// Strange error, discard the transaction and get the next in line (note, the
+			// nonce-too-high clause will prevent us from executing in vain).
+			log.Debug("Add Special Transaction failed, account skipped", "hash", tx.Hash(), "sender", from, "nonce", tx.Nonce(), "to", tx.To(), "err", err)
+			txs.Shift()
+		}
+	}
 	for {
 		// In the following three cases, we will interrupt the execution of the transaction.
 		// (1) new head block event arrival, the interrupt signal is 1
@@ -751,6 +923,10 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 		// If we don't have enough gas for any further transactions then we're done
 		if w.current.gasPool.Gas() < params.TxGas {
 			log.Trace("Not enough gas for further transactions", "have", w.current.gasPool, "want", params.TxGas)
+			break
+		}
+		if txs == nil {
+			log.Info("this block has no transaction")
 			break
 		}
 		// Retrieve the next transaction and abort if all done
@@ -788,7 +964,7 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 
 		case core.ErrNonceTooHigh:
 			// Reorg notification data race between the transaction pool and miner, skip account =
-			log.Trace("Skipping account with hight nonce", "sender", from, "nonce", tx.Nonce())
+			log.Trace("Skipping account with high nonce", "sender", from, "nonce", tx.Nonce())
 			txs.Pop()
 
 		case nil:
@@ -836,6 +1012,54 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 	tstart := time.Now()
 	parent := w.chain.CurrentBlock()
 
+	// var singers map[common.Address]struct{}
+	if parent.Hash().Hex() == w.lastParentBlockCommit {
+		return
+	}
+	if !w.announceTxs && !w.isRunning() {
+		return
+	}
+	// Only try to commit new work if we are mining
+	if w.isRunning() {
+		// check if we are right after parent's coinbase in the list
+		// only go with XDPoS
+		if w.chainConfig.XDPoS != nil {
+			// get masternodes set from latest checkpoint
+			c := w.engine.(*XDPoS.XDPoS)
+			inturn, err := c.YourTurn(w.chain, parent.Header(), w.coinbase)
+			if err != nil {
+				log.Warn("Failed when trying to commit new work", "err", err)
+				return
+			}
+			if !inturn {
+				log.Info("Not my turn to commit block. Waiting...")
+				return
+				// // calculate waitted time
+				// if preIndex == -1 {
+				// 	// first block
+				// 	return
+				// }
+				// if curIndex == -1 {
+				// 	// you're not allowed to create this block
+				// 	return
+				// }
+				// h := XDPoS.Hop(len, preIndex, curIndex)
+				// gap := waitPeriod * int64(h)
+				// // Check nearest checkpoint block in hop range.
+				// nearest := w.chainConfig.XDPoS.Epoch - (parent.Header().Number.Uint64() % w.chainConfig.XDPoS.Epoch)
+				// if uint64(h) >= nearest {
+				// 	gap = waitPeriodCheckpoint * int64(h)
+				// }
+				// log.Info("Distance from the parent block", "seconds", gap, "hops", h)
+				// waitedTime := time.Now().Unix() - int64(parent.Header().Time)
+				// if gap > waitedTime {
+				// 	return
+				// }
+				// log.Info("Wait enough. It's my turn", "waited seconds", waitedTime)
+			}
+		}
+	}
+
 	if parent.Time() >= uint64(timestamp) {
 		timestamp = int64(parent.Time() + 1)
 	}
@@ -863,7 +1087,7 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		header.Coinbase = w.coinbase
 	}
 	if err := w.engine.Prepare(w.chain, header); err != nil {
-		log.Error("Failed to prepare header for mining", "err", err)
+		log.Error("Failed to prepare header for mining new block", "err", err)
 		return
 	}
 	// If we are care about TheDAO hard-fork check whether to override the extra-data or not
@@ -890,30 +1114,32 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 	if w.chainConfig.DAOForkSupport && w.chainConfig.DAOForkBlock != nil && w.chainConfig.DAOForkBlock.Cmp(header.Number) == 0 {
 		misc.ApplyDAOHardFork(env.state)
 	}
-	// Accumulate the uncles for the current block
 	uncles := make([]*types.Header, 0, 2)
-	commitUncles := func(blocks map[common.Hash]*types.Block) {
-		// Clean up stale uncle blocks first
-		for hash, uncle := range blocks {
-			if uncle.NumberU64()+staleThreshold <= header.Number.Uint64() {
-				delete(blocks, hash)
+	if w.chainConfig.XDPoS == nil {
+		// Accumulate the uncles for the current block
+		commitUncles := func(blocks map[common.Hash]*types.Block) {
+			// Clean up stale uncle blocks first
+			for hash, uncle := range blocks {
+				if uncle.NumberU64()+staleThreshold <= header.Number.Uint64() {
+					delete(blocks, hash)
+				}
+			}
+			for hash, uncle := range blocks {
+				if len(uncles) == 2 {
+					break
+				}
+				if err := w.commitUncle(env, uncle.Header()); err != nil {
+					log.Trace("Possible uncle rejected", "hash", hash, "reason", err)
+				} else {
+					log.Debug("Committing new uncle to block", "hash", hash)
+					uncles = append(uncles, uncle.Header())
+				}
 			}
 		}
-		for hash, uncle := range blocks {
-			if len(uncles) == 2 {
-				break
-			}
-			if err := w.commitUncle(env, uncle.Header()); err != nil {
-				log.Trace("Possible uncle rejected", "hash", hash, "reason", err)
-			} else {
-				log.Debug("Committing new uncle to block", "hash", hash)
-				uncles = append(uncles, uncle.Header())
-			}
-		}
+		// Prefer to locally generated uncle
+		commitUncles(w.localUncles)
+		commitUncles(w.remoteUncles)
 	}
-	// Prefer to locally generated uncle
-	commitUncles(w.localUncles)
-	commitUncles(w.remoteUncles)
 
 	if !noempty {
 		// Create an empty block based on temporary copied state for sealing in advance without waiting block
@@ -921,17 +1147,27 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		w.commit(uncles, nil, false, tstart)
 	}
 
-	// Fill the block with all available pending transactions.
+	if common.TIPSigning.Cmp(header.Number) == 0 {
+		w.current.state.DeleteAddress(common.HexToAddress(common.BlockSigners))
+	}
+
 	pending, err := w.eth.TxPool().Pending()
-	if err != nil {
-		log.Error("Failed to fetch pending transactions", "err", err)
-		return
+	if w.chainConfig.XDPoS != nil && header.Number.Uint64()%w.chainConfig.XDPoS.Epoch != 0 {
+		// Fill the block with all available pending transactions.
+		if err != nil {
+			log.Error("Failed to fetch pending transactions", "err", err)
+			return
+		}
+		// Short circuit if there is no available pending transactions
+		if len(pending) == 0 {
+			w.updateSnapshot()
+			return
+		}
 	}
-	// Short circuit if there is no available pending transactions
-	if len(pending) == 0 {
-		w.updateSnapshot()
-		return
-	}
+
+	// TODO: do later here
+	// come from geth
+
 	// Split the pending transactions into locals and remotes
 	localTxs, remoteTxs := make(map[common.Address]types.Transactions), pending
 	for _, account := range w.eth.TxPool().Locals() {
@@ -941,14 +1177,14 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		}
 	}
 	if len(localTxs) > 0 {
-		txs := types.NewTransactionsByPriceAndNonce(w.current.signer, localTxs)
-		if w.commitTransactions(txs, w.coinbase, interrupt) {
+		txs, specialTxs := types.NewTransactionsByPriceAndNonce(w.current.signer, localTxs, nil)
+		if w.commitTransactions(txs, specialTxs, w.coinbase, interrupt) {
 			return
 		}
 	}
 	if len(remoteTxs) > 0 {
-		txs := types.NewTransactionsByPriceAndNonce(w.current.signer, remoteTxs)
-		if w.commitTransactions(txs, w.coinbase, interrupt) {
+		txs, specialTxs := types.NewTransactionsByPriceAndNonce(w.current.signer, remoteTxs, nil)
+		if w.commitTransactions(txs, specialTxs, w.coinbase, interrupt) {
 			return
 		}
 	}
@@ -976,6 +1212,8 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 		select {
 		case w.taskCh <- &task{receipts: receipts, state: s, block: block, createdAt: time.Now()}:
 			w.unconfirmed.Shift(block.NumberU64() - 1)
+			parent := w.chain.CurrentBlock()
+			w.lastParentBlockCommit = parent.Hash().Hex()
 
 			feesWei := new(big.Int)
 			for i, tx := range block.Transactions() {
@@ -983,7 +1221,7 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 			}
 			feesEth := new(big.Float).Quo(new(big.Float).SetInt(feesWei), new(big.Float).SetInt(big.NewInt(params.Ether)))
 
-			log.Info("Commit new mining work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
+			log.Info("Committing new block", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
 				"uncles", len(uncles), "txs", w.current.tcount, "gas", block.GasUsed(), "fees", feesEth, "elapsed", common.PrettyDuration(time.Since(start)))
 
 		case <-w.exitCh:

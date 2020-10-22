@@ -88,8 +88,40 @@ func NewPublicMinerAPI(e *Ethereum) *PublicMinerAPI {
 
 // Mining returns an indication if this node is currently mining.
 func (api *PublicMinerAPI) Mining() bool {
-	return api.e.IsMining()
+	return api.e.IsStaking()
 }
+
+// TODO: do later here
+// // SubmitWork can be used by external miner to submit their POW solution. It returns an indication if the work was
+// // accepted. Note, this is not an indication if the provided work was valid!
+// func (api *PublicMinerAPI) SubmitWork(nonce types.BlockNonce, solution, digest common.Hash) bool {
+// 	return api.agent.SubmitWork(nonce, digest, solution)
+// }
+
+// // GetWork returns a work package for external miner. The work package consists of 3 strings
+// // result[0], 32 bytes hex encoded current block header pow-hash
+// // result[1], 32 bytes hex encoded seed hash used for DAG
+// // result[2], 32 bytes hex encoded boundary condition ("target"), 2^256/difficulty
+// func (api *PublicMinerAPI) GetWork() ([3]string, error) {
+// 	if !api.e.IsStaking() {
+// 		if err := api.e.StartStaking(false); err != nil {
+// 			return [3]string{}, err
+// 		}
+// 	}
+// 	work, err := api.agent.GetWork()
+// 	if err != nil {
+// 		return work, fmt.Errorf("mining not ready: %v", err)
+// 	}
+// 	return work, nil
+// }
+
+// // SubmitHashrate can be used for remote miners to submit their hash rate. This enables the node to report the combined
+// // hash rate of all miners which submit work through this node. It accepts the miner hash rate and an identifier which
+// // must be unique between nodes.
+// func (api *PublicMinerAPI) SubmitHashrate(hashrate hexutil.Uint64, id common.Hash) bool {
+// 	api.agent.SubmitHashrate(id, uint64(hashrate))
+// 	return true
+// }
 
 // PrivateMinerAPI provides private RPC methods to control the miner.
 // These methods can be abused by external users and must be considered insecure for use by untrusted users.
@@ -109,15 +141,15 @@ func NewPrivateMinerAPI(e *Ethereum) *PrivateMinerAPI {
 // transaction pool.
 func (api *PrivateMinerAPI) Start(threads *int) error {
 	if threads == nil {
-		return api.e.StartMining(runtime.NumCPU())
+		return api.e.StartStaking(runtime.NumCPU())
 	}
-	return api.e.StartMining(*threads)
+	return api.e.StartStaking(*threads)
 }
 
 // Stop terminates the miner, both at the consensus engine level as well as at
 // the block creation level.
 func (api *PrivateMinerAPI) Stop() {
-	api.e.StopMining()
+	api.e.StopStaking()
 }
 
 // SetExtra sets the extra data string that is included when this miner mines a block.

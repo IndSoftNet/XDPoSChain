@@ -35,4 +35,10 @@ var (
 
 	// ErrNoGenesis is returned when there is no Genesis Block.
 	ErrNoGenesis = errors.New("genesis not found in chain")
+
+	ErrNotXDPoS = errors.New("XDPoS not found in config")
+
+	ErrNotFoundM1 = errors.New("list M1 not found ")
+
+	ErrStopPreparingBlock = errors.New("stop calculating a block not verified by M2")
 )

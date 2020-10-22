@@ -113,11 +113,12 @@ func (s *SimAdapter) NewNode(config *NodeConfig) (Node, error) {
 	}
 
 	simNode := &SimNode{
-		ID:      id,
-		config:  config,
-		node:    n,
-		adapter: s,
-		running: make(map[string]node.Service),
+		ID:        id,
+		config:    config,
+		node:      n,
+		adapter:   s,
+		running:   make(map[string]node.Service),
+		connected: make(map[enode.ID]bool),
 	}
 	s.nodes[id] = simNode
 	return simNode, nil
@@ -129,6 +130,9 @@ func (s *SimAdapter) Dial(dest *enode.Node) (conn net.Conn, err error) {
 	node, ok := s.GetNode(dest.ID())
 	if !ok {
 		return nil, fmt.Errorf("unknown node: %s", dest.ID())
+	}
+	if node.connected[dest.ID()] {
+		return nil, fmt.Errorf("dialed node: %s", dest.ID())
 	}
 	srv := node.Server()
 	if srv == nil {
@@ -143,6 +147,7 @@ func (s *SimAdapter) Dial(dest *enode.Node) (conn net.Conn, err error) {
 	// asynchronously call the dialed destination node's p2p server
 	// to set up connection on the 'listening' side
 	go srv.SetupConn(pipe1, 0, nil)
+	node.connected[dest.ID()] = true
 	return pipe2, nil
 }
 
@@ -180,6 +185,7 @@ type SimNode struct {
 	running      map[string]node.Service
 	client       *rpc.Client
 	registerOnce sync.Once
+	connected    map[enode.ID]bool
 }
 
 // Close closes the underlaying node.Node to release

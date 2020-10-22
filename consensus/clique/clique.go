@@ -115,7 +115,7 @@ var (
 	errInvalidUncleHash = errors.New("non empty uncle hash")
 
 	// errInvalidDifficulty is returned if the difficulty of a block neither 1 or 2.
-	errInvalidDifficulty = errors.New("invalid difficulty")
+	errInvalidDifficulty = errors.New("invalid CLIQ difficulty")
 
 	// errWrongDifficulty is returned if the difficulty of a block doesn't match the
 	// turn of the signer.
@@ -604,6 +604,7 @@ func (c *Clique) Seal(chain consensus.ChainReader, block *types.Block, results c
 	if err != nil {
 		return err
 	}
+	masternodes := []common.Address{}
 	if _, authorized := snap.Signers[signer]; !authorized {
 		return errUnauthorizedSigner
 	}
@@ -611,7 +612,7 @@ func (c *Clique) Seal(chain consensus.ChainReader, block *types.Block, results c
 	for seen, recent := range snap.Recents {
 		if recent == signer {
 			// Signer is among recents, only wait if the current block doesn't shift it out
-			if limit := uint64(len(snap.Signers)/2 + 1); number < limit || seen > number-limit {
+			if limit := uint64(len(masternodes)/2 + 1); number < limit || seen > number-limit {
 				log.Info("Signed recently, must wait for others")
 				return nil
 			}

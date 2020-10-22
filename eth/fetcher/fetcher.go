@@ -27,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	lru "github.com/hashicorp/golang-lru"
 )
 
 const (
@@ -61,8 +62,10 @@ type blockBroadcasterFn func(block *types.Block, propagate bool)
 // chainHeightFn is a callback type to retrieve the current chain height.
 type chainHeightFn func() uint64
 
-// chainInsertFn is a callback type to insert a batch of blocks into the local chain.
-type chainInsertFn func(types.Blocks) (int, error)
+// blockInsertFn is a callback type to insert a batch of blocks into the local chain.
+type blockInsertFn func(block *types.Block) error
+
+type blockPrepareFn func(block *types.Block) error
 
 // peerDropFn is a callback type for dropping a peer detected as malicious.
 type peerDropFn func(id string)
@@ -127,25 +130,29 @@ type Fetcher struct {
 	queue  *prque.Prque            // Queue containing the import operations (block number sorted)
 	queues map[string]int          // Per peer block counts to prevent memory exhaustion
 	queued map[common.Hash]*inject // Set of already queued blocks (to dedupe imports)
+	knowns *lru.ARCCache
 
 	// Callbacks
 	getBlock       blockRetrievalFn   // Retrieves a block from the local chain
 	verifyHeader   headerVerifierFn   // Checks if a block's headers have a valid proof of work
 	broadcastBlock blockBroadcasterFn // Broadcasts a block to connected peers
 	chainHeight    chainHeightFn      // Retrieves the current chain's height
-	insertChain    chainInsertFn      // Injects a batch of blocks into the chain
-	dropPeer       peerDropFn         // Drops a peer for misbehaving
+	insertBlock    blockInsertFn      // Injects a batch of blocks into the chain
+	prepareBlock   blockPrepareFn
+	dropPeer       peerDropFn // Drops a peer for misbehaving
 
 	// Testing hooks
 	announceChangeHook func(common.Hash, bool) // Method to call upon adding or deleting a hash from the announce list
 	queueChangeHook    func(common.Hash, bool) // Method to call upon adding or deleting a block from the import queue
 	fetchingHook       func([]common.Hash)     // Method to call upon starting a block (eth/61) or header (eth/62) fetch
 	completingHook     func([]common.Hash)     // Method to call upon starting a block body fetch (eth/62)
-	importedHook       func(*types.Block)      // Method to call upon successful block import (both eth/61 and eth/62)
+	signHook           func(*types.Block) error
+	appendM2HeaderHook func(*types.Block) (*types.Block, bool, error)
 }
 
 // New creates a block fetcher to retrieve blocks based on hash announcements.
-func New(getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertChain chainInsertFn, dropPeer peerDropFn) *Fetcher {
+func New(getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertBlock blockInsertFn, prepareBlock blockPrepareFn, dropPeer peerDropFn) *Fetcher {
+	knownBlocks, _ := lru.NewARC(blockLimit)
 	return &Fetcher{
 		notify:         make(chan *announce),
 		inject:         make(chan *inject),
@@ -161,11 +168,13 @@ func New(getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBloc
 		queue:          prque.New(nil),
 		queues:         make(map[string]int),
 		queued:         make(map[common.Hash]*inject),
+		knowns:         knownBlocks,
 		getBlock:       getBlock,
 		verifyHeader:   verifyHeader,
 		broadcastBlock: broadcastBlock,
 		chainHeight:    chainHeight,
-		insertChain:    insertChain,
+		insertBlock:    insertBlock,
+		prepareBlock:   prepareBlock,
 		dropPeer:       dropPeer,
 	}
 }
@@ -438,7 +447,7 @@ func (f *Fetcher) loop() {
 			headerFilterInMeter.Mark(int64(len(task.headers)))
 
 			// Split the batch of headers into unknown ones (to return to the caller),
-			// known incomplete ones (requiring body retrievals) and completed blocks.
+			// knowns incomplete ones (requiring body retrievals) and completed blocks.
 			unknown, incomplete, complete := []*types.Header{}, []*announce{}, []*types.Block{}
 			for _, header := range task.headers {
 				hash := header.Hash()
@@ -598,7 +607,10 @@ func (f *Fetcher) rescheduleComplete(complete *time.Timer) {
 // has not yet been seen.
 func (f *Fetcher) enqueue(peer string, block *types.Block) {
 	hash := block.Hash()
-
+	if f.knowns.Contains(hash) {
+		log.Trace("Discarded propagated block, known block", "peer", peer, "number", block.Number(), "hash", hash, "limit", blockLimit)
+		return
+	}
 	// Ensure the peer isn't DOSing us
 	count := f.queues[peer] + 1
 	if count > blockLimit {
@@ -622,6 +634,7 @@ func (f *Fetcher) enqueue(peer string, block *types.Block) {
 		}
 		f.queues[peer] = count
 		f.queued[hash] = op
+		f.knowns.Add(hash, true)
 		f.queue.Push(op, -int64(block.NumberU64()))
 		if f.queueChangeHook != nil {
 			f.queueChangeHook(op.block.Hash(), true)
@@ -647,16 +660,48 @@ func (f *Fetcher) insert(peer string, block *types.Block) {
 			log.Debug("Unknown parent of propagated block", "peer", peer, "number", block.Number(), "hash", hash, "parent", block.ParentHash())
 			return
 		}
+		fastBroadCast := true
+	again:
+		err := f.verifyHeader(block.Header())
 		// Quickly validate the header and propagate the block if it passes
-		switch err := f.verifyHeader(block.Header()); err {
+		switch err {
 		case nil:
 			// All ok, quickly propagate to our peers
 			propBroadcastOutTimer.UpdateSince(block.ReceivedAt)
-			go f.broadcastBlock(block, true)
-
+			if fastBroadCast {
+				go f.broadcastBlock(block, true)
+			}
 		case consensus.ErrFutureBlock:
-			// Weird future block, don't fail, but neither propagate
-
+			delay := time.Unix(int64(block.Time()), 0).Sub(time.Now()) // nolint: gosimple
+			log.Info("Receive future block", "number", block.NumberU64(), "hash", block.Hash().Hex(), "delay", delay)
+			time.Sleep(delay)
+			goto again
+		case consensus.ErrNoValidatorSignature:
+			newBlock := block
+			var errM2 error
+			isM2 := false
+			if f.appendM2HeaderHook != nil {
+				if newBlock, isM2, errM2 = f.appendM2HeaderHook(block); errM2 != nil {
+					log.Error("Append m2 to block header fail", "err", errM2)
+					return
+				}
+			}
+			if !isM2 {
+				go f.broadcastBlock(block, true)
+				if err := f.prepareBlock(block); err != nil {
+					log.Debug("Propagated block prepare failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
+					return
+				}
+				return
+			}
+			log.Debug("Append M2 to header block", "numer", block.NumberU64(), "hahs", block.Hash())
+			if err := f.prepareBlock(block); err != nil {
+				log.Debug("Propagated block prepare failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
+				return
+			}
+			block = newBlock
+			fastBroadCast = false
+			goto again
 		default:
 			// Something went very wrong, drop the peer
 			log.Debug("Propagated block verification failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
@@ -664,17 +709,21 @@ func (f *Fetcher) insert(peer string, block *types.Block) {
 			return
 		}
 		// Run the actual import and log any issues
-		if _, err := f.insertChain(types.Blocks{block}); err != nil {
+		if err := f.insertBlock(block); err != nil {
 			log.Debug("Propagated block import failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
 			return
 		}
+
+		if f.signHook != nil {
+			if err := f.signHook(block); err != nil {
+				log.Error("Can't sign the imported block", "err", err)
+				return
+			}
+		}
 		// If import succeeded, broadcast the block
 		propAnnounceOutTimer.UpdateSince(block.ReceivedAt)
-		go f.broadcastBlock(block, false)
-
-		// Invoke the testing hook if needed
-		if f.importedHook != nil {
-			f.importedHook(block)
+		if !fastBroadCast {
+			go f.broadcastBlock(block, true)
 		}
 	}()
 }
@@ -731,4 +780,14 @@ func (f *Fetcher) forgetBlock(hash common.Hash) {
 		}
 		delete(f.queued, hash)
 	}
+}
+
+// Bind double validate hook before block imported into chain.
+func (f *Fetcher) SetSignHook(signHook func(*types.Block) error) {
+	f.signHook = signHook
+}
+
+// Bind append m2 to block header hook when imported into chain.
+func (f *Fetcher) SetAppendM2HeaderHook(appendM2HeaderHook func(*types.Block) (*types.Block, bool, error)) {
+	f.appendM2HeaderHook = appendM2HeaderHook
 }

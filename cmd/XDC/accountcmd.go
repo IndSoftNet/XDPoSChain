@@ -307,12 +307,18 @@ func accountCreate(ctx *cli.Context) error {
 
 	password := getPassPhrase("Your new account is locked with a password. Please give a password. Do not forget this password.", true, 0, utils.MakePasswordList(ctx))
 
-	address, err := keystore.StoreKey(keydir, password, scryptN, scryptP)
+	account, err := keystore.StoreKey(keydir, password, scryptN, scryptP)
 
 	if err != nil {
 		utils.Fatalf("Failed to create account: %v", err)
 	}
-	fmt.Printf("Address: {xdc%x}\n", address)
+	fmt.Printf("\nYour new key was generated\n\n")
+	fmt.Printf("Public address of the key:   {xdc%x}\n", account)
+	fmt.Printf("Path of the secret key file: %s\n\n", account.URL.Path)
+	fmt.Printf("- You can share your public address with anyone. Others need it to interact with you.\n")
+	fmt.Printf("- You must NEVER share the secret key with anyone! The key controls access to your funds!\n")
+	fmt.Printf("- You must BACKUP your key file! Without the key, it's impossible to access account funds!\n")
+	fmt.Printf("- You must REMEMBER your password! Without the password, it's impossible to decrypt the key!\n\n")
 	return nil
 }
 
@@ -340,7 +346,7 @@ func importWallet(ctx *cli.Context) error {
 	if len(keyfile) == 0 {
 		utils.Fatalf("keyfile must be given as argument")
 	}
-	keyJson, err := ioutil.ReadFile(keyfile)
+	keyJSON, err := ioutil.ReadFile(keyfile)
 	if err != nil {
 		utils.Fatalf("Could not read wallet file: %v", err)
 	}
@@ -349,7 +355,7 @@ func importWallet(ctx *cli.Context) error {
 	passphrase := getPassPhrase("", false, 0, utils.MakePasswordList(ctx))
 
 	ks := stack.AccountManager().Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
-	acct, err := ks.ImportPreSaleKey(keyJson, passphrase)
+	acct, err := ks.ImportPreSaleKey(keyJSON, passphrase)
 	if err != nil {
 		utils.Fatalf("%v", err)
 	}

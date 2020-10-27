@@ -26,7 +26,9 @@ const (
 var TIP2019Block = big.NewInt(1)
 var TIPSigning = big.NewInt(3000000)
 var TIPRandomize = big.NewInt(3464000)
-var TIPIncreaseMasternodes = big.NewInt(5000000) // Upgrade MN Count at Block.
+var TIPRandomizeMechansim = big.NewInt(1000000) // example 1.milion
+var TIPIncreaseMasternodes = big.NewInt(10000000) // example 10 milions
+
 var IsTestnet bool = false
 var StoreRewardFolder string
 var RollbackHash Hash

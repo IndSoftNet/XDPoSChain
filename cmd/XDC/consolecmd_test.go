@@ -51,7 +51,9 @@ func TestConsoleWelcome(t *testing.T) {
 	geth.SetTemplateFunc("goarch", func() string { return runtime.GOARCH })
 	geth.SetTemplateFunc("gover", runtime.Version)
 	geth.SetTemplateFunc("XDCver", func() string { return params.VersionWithCommit("", "") })
-	geth.SetTemplateFunc("niltime", func() string { return time.Unix(0, 0).Format(time.RFC1123) })
+	geth.SetTemplateFunc("niltime", func() string {
+		return time.Unix(0, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
+	})
 	geth.SetTemplateFunc("apis", func() string { return ipcAPIs })
 
 	// Verify the actual welcome message to the required template
@@ -71,7 +73,7 @@ at block: 0 ({{niltime}})
 
 // Tests that a console can be attached to a running node via various means.
 func TestIPCAttachWelcome(t *testing.T) {
-	// Configure the instance for IPC attachement
+	// Configure the instance for IPC attachment
 	coinbase := "0x8605cdbbdb6d264aa742e77020dcbc58fcdce182"
 	var ipc string
 	if runtime.GOOS == "windows" {
@@ -85,11 +87,14 @@ func TestIPCAttachWelcome(t *testing.T) {
 		"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none",
 		"--etherbase", coinbase, "--ipcpath", ipc)
 
-	time.Sleep(2 * time.Second) // Simple way to wait for the RPC endpoint to open
+	defer func() {
+		XDC.Interrupt()
+		XDC.ExpectExit()
+	}()
+
+	waitForEndpoint(t, ipc, 3*time.Second)
 	testAttachWelcome(t, XDC, "ipc:"+ipc, ipcAPIs)
 
-	XDC.Interrupt()
-	XDC.ExpectExit()
 }
 
 func TestHTTPAttachWelcome(t *testing.T) {
@@ -97,13 +102,15 @@ func TestHTTPAttachWelcome(t *testing.T) {
 	port := strconv.Itoa(trulyRandInt(1024, 65536)) // Yeah, sometimes this will fail, sorry :P
 	XDC := runXDC(t,
 		"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none",
-		"--etherbase", coinbase, "--rpc", "--rpcport", port)
+		"--etherbase", coinbase, "--http", "--http.port", port)
+	defer func() {
+		XDC.Interrupt()
+		XDC.ExpectExit()
+	}()
 
-	time.Sleep(2 * time.Second) // Simple way to wait for the RPC endpoint to open
-	testAttachWelcome(t, XDC, "http://localhost:"+port, httpAPIs)
-
-	XDC.Interrupt()
-	XDC.ExpectExit()
+	endpoint := "http://127.0.0.1:" + port
+	waitForEndpoint(t, endpoint, 3*time.Second)
+	testAttachWelcome(t, XDC, endpoint, httpAPIs)
 }
 
 func TestWSAttachWelcome(t *testing.T) {
@@ -112,13 +119,15 @@ func TestWSAttachWelcome(t *testing.T) {
 
 	XDC := runXDC(t,
 		"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none",
-		"--etherbase", coinbase, "--ws", "--wsport", port)
+		"--etherbase", coinbase, "--ws", "--ws.port", port)
+	defer func() {
+		XDC.Interrupt()
+		XDC.ExpectExit()
+	}()
 
-	time.Sleep(2 * time.Second) // Simple way to wait for the RPC endpoint to open
-	testAttachWelcome(t, XDC, "ws://localhost:"+port, httpAPIs)
-
-	XDC.Interrupt()
-	XDC.ExpectExit()
+	endpoint := "ws://127.0.0.1:" + port
+	waitForEndpoint(t, endpoint, 3*time.Second)
+	testAttachWelcome(t, XDC, endpoint, httpAPIs)
 }
 
 func testAttachWelcome(t *testing.T, XDC *testXDC, endpoint, apis string) {
@@ -133,7 +142,9 @@ func testAttachWelcome(t *testing.T, XDC *testXDC, endpoint, apis string) {
 	attach.SetTemplateFunc("gover", runtime.Version)
 	attach.SetTemplateFunc("XDCver", func() string { return params.VersionWithCommit("", "") })
 	attach.SetTemplateFunc("etherbase", func() string { return XDC.Etherbase })
-	attach.SetTemplateFunc("niltime", func() string { return time.Unix(0, 0).Format(time.RFC1123) })
+	attach.SetTemplateFunc("niltime", func() string {
+		return time.Unix(0, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
+	})
 	attach.SetTemplateFunc("ipc", func() bool { return strings.HasPrefix(endpoint, "ipc") })
 	attach.SetTemplateFunc("datadir", func() string { return XDC.Datadir })
 	attach.SetTemplateFunc("apis", func() string { return apis })

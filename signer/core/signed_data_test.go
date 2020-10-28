@@ -1,22 +1,23 @@
-// Copyright 2018 The go-ethereum Authors
-// This file is part of go-ethereum.
+// Copyright 2019 The go-ethereum Authors
+// This file is part of the go-ethereum library.
 //
-// go-ethereum is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// go-ethereum is distributed in the hope that it will be useful,
+// The go-ethereum library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
+// GNU Lesser General Public License for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with go-ethereum. If not, see <http://www.gnu.org/licenses/>.
-//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
 package core_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -245,6 +246,10 @@ func TestDomainChainId(t *testing.T) {
 	if _, ok := withoutChainID.Domain.Map()["chainId"]; ok {
 		t.Errorf("Expected the chainId key to not be present in the domain map")
 	}
+	// should encode successfully
+	if _, err := withoutChainID.HashStruct("EIP712Domain", withoutChainID.Domain.Map()); err != nil {
+		t.Errorf("Expected the typedData to encode the domain successfully, got %v", err)
+	}
 	withChainID := core.TypedData{
 		Types: core.Types{
 			"EIP712Domain": []core.Type{
@@ -260,6 +265,10 @@ func TestDomainChainId(t *testing.T) {
 
 	if _, ok := withChainID.Domain.Map()["chainId"]; !ok {
 		t.Errorf("Expected the chainId key be present in the domain map")
+	}
+	// should encode successfully
+	if _, err := withChainID.HashStruct("EIP712Domain", withChainID.Domain.Map()); err != nil {
+		t.Errorf("Expected the typedData to encode the domain successfully, got %v", err)
 	}
 }
 
@@ -321,11 +330,11 @@ func TestFormatter(t *testing.T) {
 	}
 	formatted, _ := d.Format()
 	for _, item := range formatted {
-		fmt.Printf("'%v'\n", item.Pprint(0))
+		t.Logf("'%v'\n", item.Pprint(0))
 	}
 
 	j, _ := json.Marshal(formatted)
-	fmt.Printf("'%v'\n", string(j))
+	t.Logf("'%v'\n", string(j))
 }
 
 func sign(typedData core.TypedData) ([]byte, []byte, error) {
@@ -358,13 +367,13 @@ func TestJsonFiles(t *testing.T) {
 			continue
 		}
 		var typedData core.TypedData
-		err = json.Unmarshal([]byte(data), &typedData)
+		err = json.Unmarshal(data, &typedData)
 		if err != nil {
 			t.Errorf("Test %d, file %v, json unmarshalling failed: %v", i, fInfo.Name(), err)
 			continue
 		}
 		_, _, err = sign(typedData)
-		fmt.Printf("Error %v\n", err)
+		t.Logf("Error %v\n", err)
 		if err != nil && !expectedFailure {
 			t.Errorf("Test %d failed, file %v: %v", i, fInfo.Name(), err)
 		}
@@ -390,19 +399,135 @@ func TestFuzzerFiles(t *testing.T) {
 			continue
 		}
 		var typedData core.TypedData
-		err = json.Unmarshal([]byte(data), &typedData)
+		err = json.Unmarshal(data, &typedData)
 		if err != nil {
 			t.Errorf("Test %d, file %v, json unmarshalling failed: %v", i, fInfo.Name(), err)
 			continue
 		}
 		_, err = typedData.EncodeData("EIP712Domain", typedData.Domain.Map(), 1)
 		if verbose && err != nil {
-			fmt.Printf("%d, EncodeData[1] err: %v\n", i, err)
+			t.Logf("%d, EncodeData[1] err: %v\n", i, err)
 		}
 		_, err = typedData.EncodeData(typedData.PrimaryType, typedData.Message, 1)
 		if verbose && err != nil {
-			fmt.Printf("%d, EncodeData[2] err: %v\n", i, err)
+			t.Logf("%d, EncodeData[2] err: %v\n", i, err)
 		}
 		typedData.Format()
+	}
+}
+
+var gnosisTypedData = `
+{
+	"types": {
+		"EIP712Domain": [
+			{ "type": "address", "name": "verifyingContract" }
+		],
+		"SafeTx": [
+			{ "type": "address", "name": "to" },
+			{ "type": "uint256", "name": "value" },
+			{ "type": "bytes", "name": "data" },
+			{ "type": "uint8", "name": "operation" },
+			{ "type": "uint256", "name": "safeTxGas" },
+			{ "type": "uint256", "name": "baseGas" },
+			{ "type": "uint256", "name": "gasPrice" },
+			{ "type": "address", "name": "gasToken" },
+			{ "type": "address", "name": "refundReceiver" },
+			{ "type": "uint256", "name": "nonce" }
+		]
+	},
+	"domain": {
+		"verifyingContract": "0x25a6c4BBd32B2424A9c99aEB0584Ad12045382B3"
+	},
+	"primaryType": "SafeTx",
+	"message": {
+		"to": "0x9eE457023bB3De16D51A003a247BaEaD7fce313D",
+		"value": "20000000000000000",
+		"data": "0x",
+		"operation": 0,
+		"safeTxGas": 27845,
+		"baseGas": 0,
+		"gasPrice": "0",
+		"gasToken": "0x0000000000000000000000000000000000000000",
+		"refundReceiver": "0x0000000000000000000000000000000000000000",
+		"nonce": 3
+	}
+}`
+
+var gnosisTx = `
+{
+      "safe": "0x25a6c4BBd32B2424A9c99aEB0584Ad12045382B3",
+      "to": "0x9eE457023bB3De16D51A003a247BaEaD7fce313D",
+      "value": "20000000000000000",
+      "data": null,
+      "operation": 0,
+      "gasToken": "0x0000000000000000000000000000000000000000",
+      "safeTxGas": 27845,
+      "baseGas": 0,
+      "gasPrice": "0",
+      "refundReceiver": "0x0000000000000000000000000000000000000000",
+      "nonce": 3,
+      "executionDate": null,
+      "submissionDate": "2020-09-15T21:59:23.815748Z",
+      "modified": "2020-09-15T21:59:23.815748Z",
+      "blockNumber": null,
+      "transactionHash": null,
+      "safeTxHash": "0x28bae2bd58d894a1d9b69e5e9fde3570c4b98a6fc5499aefb54fb830137e831f",
+      "executor": null,
+      "isExecuted": false,
+      "isSuccessful": null,
+      "ethGasPrice": null,
+      "gasUsed": null,
+      "fee": null,
+      "origin": null,
+      "dataDecoded": null,
+      "confirmationsRequired": null,
+      "confirmations": [
+        {
+          "owner": "0xAd2e180019FCa9e55CADe76E4487F126Fd08DA34",
+          "submissionDate": "2020-09-15T21:59:28.281243Z",
+          "transactionHash": null,
+          "confirmationType": "CONFIRMATION",
+          "signature": "0x5e562065a0cb15d766dac0cd49eb6d196a41183af302c4ecad45f1a81958d7797753f04424a9b0aa1cb0448e4ec8e189540fbcdda7530ef9b9d95dfc2d36cb521b",
+          "signatureType": "EOA"
+        }
+      ],
+      "signatures": null
+    }
+`
+
+// TestGnosisTypedData tests the scenario where a user submits a full EIP-712
+// struct without using the gnosis-specific endpoint
+func TestGnosisTypedData(t *testing.T) {
+	var td core.TypedData
+	err := json.Unmarshal([]byte(gnosisTypedData), &td)
+	if err != nil {
+		t.Fatalf("unmarshalling failed '%v'", err)
+	}
+	_, sighash, err := sign(td)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expSigHash := common.FromHex("0x28bae2bd58d894a1d9b69e5e9fde3570c4b98a6fc5499aefb54fb830137e831f")
+	if !bytes.Equal(expSigHash, sighash) {
+		t.Fatalf("Error, got %x, wanted %x", sighash, expSigHash)
+	}
+}
+
+// TestGnosisCustomData tests the scenario where a user submits only the gnosis-safe
+// specific data, and we fill the TypedData struct on our side
+func TestGnosisCustomData(t *testing.T) {
+	var tx core.GnosisSafeTx
+	err := json.Unmarshal([]byte(gnosisTx), &tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var td = tx.ToTypedData()
+	_, sighash, err := sign(td)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expSigHash := common.FromHex("0x28bae2bd58d894a1d9b69e5e9fde3570c4b98a6fc5499aefb54fb830137e831f")
+	if !bytes.Equal(expSigHash, sighash) {
+		t.Fatalf("Error, got %x, wanted %x", sighash, expSigHash)
 	}
 }

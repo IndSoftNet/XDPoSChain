@@ -29,6 +29,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"text/template"
+
 )
 
 var DryRunFlag = flag.Bool("n", false, "dry run, don't execute commands")
@@ -48,15 +50,6 @@ func MustRun(cmd *exec.Cmd) {
 
 func MustRunCommand(cmd string, args ...string) {
 	MustRun(exec.Command(cmd, args...))
-}
-
-// GOPATH returns the value that the GOPATH environment
-// variable should be set to.
-func GOPATH() string {
-	if os.Getenv("GOPATH") == "" {
-		log.Fatal("GOPATH is not set")
-	}
-	return os.Getenv("GOPATH")
 }
 
 var warnedAboutGit bool
@@ -89,24 +82,30 @@ func readGitFile(file string) string {
 	return strings.TrimSpace(string(content))
 }
 
-// CopyFile copies a file.
-func CopyFile(dst, src string, mode os.FileMode) {
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+// Render renders the given template file into outputFile.
+func Render(templateFile, outputFile string, outputPerm os.FileMode, x interface{}) {
+	tpl := template.Must(template.ParseFiles(templateFile))
+	render(tpl, outputFile, outputPerm, x)
+}
+
+// RenderString renders the given template string into outputFile.
+func RenderString(templateContent, outputFile string, outputPerm os.FileMode, x interface{}) {
+	tpl := template.Must(template.New("").Parse(templateContent))
+	render(tpl, outputFile, outputPerm, x)
+}
+
+func render(tpl *template.Template, outputFile string, outputPerm os.FileMode, x interface{}) {
+	if err := os.MkdirAll(filepath.Dir(outputFile), 0755); err != nil {
 		log.Fatal(err)
 	}
-	destFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	out, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_EXCL, outputPerm)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer destFile.Close()
-
-	srcFile, err := os.Open(src)
-	if err != nil {
+	if err := tpl.Execute(out, x); err != nil {
 		log.Fatal(err)
 	}
-	defer srcFile.Close()
-
-	if _, err := io.Copy(destFile, srcFile); err != nil {
+	if err := out.Close(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -122,32 +121,6 @@ func CopyFile(dst, src string, mode os.FileMode) {
 func GoTool(tool string, args ...string) *exec.Cmd {
 	args = append([]string{tool}, args...)
 	return exec.Command(filepath.Join(runtime.GOROOT(), "bin", "go"), args...)
-}
-
-// ExpandPackagesNoVendor expands a cmd/go import path pattern, skipping
-// vendored packages.
-func ExpandPackagesNoVendor(patterns []string) []string {
-	expand := false
-	for _, pkg := range patterns {
-		if strings.Contains(pkg, "...") {
-			expand = true
-		}
-	}
-	if expand {
-		cmd := GoTool("list", patterns...)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Fatalf("package listing failed: %v\n%s", err, string(out))
-		}
-		var packages []string
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.Contains(line, "/vendor/") {
-				packages = append(packages, strings.TrimSpace(line))
-			}
-		}
-		return packages
-	}
-	return patterns
 }
 
 // UploadSFTP uploads files to a remote host using the sftp command line tool.

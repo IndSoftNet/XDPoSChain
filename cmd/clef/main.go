@@ -29,9 +29,9 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,10 +40,10 @@ import (
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/console"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
+	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/params"
@@ -53,6 +53,9 @@ import (
 	"github.com/ethereum/go-ethereum/signer/fourbyte"
 	"github.com/ethereum/go-ethereum/signer/rules"
 	"github.com/ethereum/go-ethereum/signer/storage"
+
+	colorable "github.com/mattn/go-colorable"
+	"github.com/mattn/go-isatty"
 	"gopkg.in/urfave/cli.v1"
 )
 
@@ -80,6 +83,10 @@ var (
 		Name:  "advanced",
 		Usage: "If enabled, issues warnings instead of rejections for suspicious requests. Default off",
 	}
+	acceptFlag = cli.BoolFlag{
+		Name:  "suppress-bootwarn",
+		Usage: "If set, does not show the warning during boot",
+	}
 	keystoreFlag = cli.StringFlag{
 		Name:  "keystore",
 		Value: filepath.Join(node.DefaultDataDir(), "keystore"),
@@ -96,8 +103,13 @@ var (
 		Usage: "Chain id to use for signing (1=mainnet, 3=Ropsten, 4=Rinkeby, 5=Goerli)",
 	}
 	rpcPortFlag = cli.IntFlag{
-		Name:  "rpcport",
+		Name:  "http.port",
 		Usage: "HTTP-RPC server listening port",
+		Value: node.DefaultHTTPPort + 5,
+	}
+	legacyRPCPortFlag = cli.IntFlag{
+		Name:  "rpcport",
+		Usage: "HTTP-RPC server listening port (Deprecated, please use --http.port).",
 		Value: node.DefaultHTTPPort + 5,
 	}
 	signerSecretFlag = cli.StringFlag{
@@ -185,6 +197,22 @@ The setpw command stores a password for a given address (keyfile).
 		Description: `
 The delpw command removes a password for a given address (keyfile).
 `}
+	newAccountCommand = cli.Command{
+		Action:    utils.MigrateFlags(newAccount),
+		Name:      "newaccount",
+		Usage:     "Create a new account",
+		ArgsUsage: "",
+		Flags: []cli.Flag{
+			logLevelFlag,
+			keystoreFlag,
+			utils.LightKDFFlag,
+			acceptFlag,
+		},
+		Description: `
+The newaccount command creates a new keystore-backed account. It is a convenience-method
+which can be used in lieu of an external UI.`,
+	}
+
 	gendocCommand = cli.Command{
 		Action: GenDoc,
 		Name:   "gendoc",
@@ -193,6 +221,42 @@ The delpw command removes a password for a given address (keyfile).
 The gendoc generates example structures of the json-rpc communication types.
 `}
 )
+
+// AppHelpFlagGroups is the application flags, grouped by functionality.
+var AppHelpFlagGroups = []flags.FlagGroup{
+	{
+		Name: "FLAGS",
+		Flags: []cli.Flag{
+			logLevelFlag,
+			keystoreFlag,
+			configdirFlag,
+			chainIdFlag,
+			utils.LightKDFFlag,
+			utils.NoUSBFlag,
+			utils.SmartCardDaemonPathFlag,
+			utils.HTTPListenAddrFlag,
+			utils.HTTPVirtualHostsFlag,
+			utils.IPCDisabledFlag,
+			utils.IPCPathFlag,
+			utils.HTTPEnabledFlag,
+			rpcPortFlag,
+			signerSecretFlag,
+			customDBFlag,
+			auditLogFlag,
+			ruleFlag,
+			stdiouiFlag,
+			testFlag,
+			advancedMode,
+			acceptFlag,
+		},
+	},
+	{
+		Name: "ALIASED (deprecated)",
+		Flags: []cli.Flag{
+			legacyRPCPortFlag,
+		},
+	},
+}
 
 func init() {
 	app.Name = "Clef"
@@ -205,11 +269,11 @@ func init() {
 		utils.LightKDFFlag,
 		utils.NoUSBFlag,
 		utils.SmartCardDaemonPathFlag,
-		utils.RPCListenAddrFlag,
-		utils.RPCVirtualHostsFlag,
+		utils.HTTPListenAddrFlag,
+		utils.HTTPVirtualHostsFlag,
 		utils.IPCDisabledFlag,
 		utils.IPCPathFlag,
-		utils.RPCEnabledFlag,
+		utils.HTTPEnabledFlag,
 		rpcPortFlag,
 		signerSecretFlag,
 		customDBFlag,
@@ -218,9 +282,51 @@ func init() {
 		stdiouiFlag,
 		testFlag,
 		advancedMode,
+		acceptFlag,
+		legacyRPCPortFlag,
 	}
 	app.Action = signer
-	app.Commands = []cli.Command{initCommand, attestCommand, setCredentialCommand, delCredentialCommand, gendocCommand}
+	app.Commands = []cli.Command{initCommand,
+		attestCommand,
+		setCredentialCommand,
+		delCredentialCommand,
+		newAccountCommand,
+		gendocCommand}
+	cli.CommandHelpTemplate = flags.CommandHelpTemplate
+	// Override the default app help template
+	cli.AppHelpTemplate = flags.ClefAppHelpTemplate
+
+	// Override the default app help printer, but only for the global app help
+	originalHelpPrinter := cli.HelpPrinter
+	cli.HelpPrinter = func(w io.Writer, tmpl string, data interface{}) {
+		if tmpl == flags.ClefAppHelpTemplate {
+			// Render out custom usage screen
+			originalHelpPrinter(w, tmpl, flags.HelpData{App: data, FlagGroups: AppHelpFlagGroups})
+		} else if tmpl == flags.CommandHelpTemplate {
+			// Iterate over all command specific flags and categorize them
+			categorized := make(map[string][]cli.Flag)
+			for _, flag := range data.(cli.Command).Flags {
+				if _, ok := categorized[flag.String()]; !ok {
+					categorized[flags.FlagCategory(flag, AppHelpFlagGroups)] = append(categorized[flags.FlagCategory(flag, AppHelpFlagGroups)], flag)
+				}
+			}
+
+			// sort to get a stable ordering
+			sorted := make([]flags.FlagGroup, 0, len(categorized))
+			for cat, flgs := range categorized {
+				sorted = append(sorted, flags.FlagGroup{Name: cat, Flags: flgs})
+			}
+			sort.Sort(flags.ByCategory(sorted))
+
+			// add sorted array to data and render with default printer
+			originalHelpPrinter(w, tmpl, map[string]interface{}{
+				"cmd":              data,
+				"categorizedFlags": sorted,
+			})
+		} else {
+			originalHelpPrinter(w, tmpl, data)
+		}
+	}
 }
 
 func main() {
@@ -260,7 +366,7 @@ func initializeSecrets(c *cli.Context) error {
 	text := "The master seed of clef will be locked with a password.\nPlease specify a password. Do not forget this password!"
 	var password string
 	for {
-		password = getPassPhrase(text, true)
+		password = utils.GetPassPhrase(text, true)
 		if err := core.ValidatePasswordFormat(password); err != nil {
 			fmt.Printf("invalid password: %v\n", err)
 		} else {
@@ -333,7 +439,7 @@ func setCredential(ctx *cli.Context) error {
 		utils.Fatalf("Invalid address specified: %s", addr)
 	}
 	address := common.HexToAddress(addr)
-	password := getPassPhrase("Please enter a passphrase to store for this address:", true)
+	password := utils.GetPassPhrase("Please enter a password to store for this address:", true)
 	fmt.Println()
 
 	stretchedKey, err := readMasterKey(ctx, nil)
@@ -379,21 +485,75 @@ func removeCredential(ctx *cli.Context) error {
 	return nil
 }
 
+func newAccount(c *cli.Context) error {
+	if err := initialize(c); err != nil {
+		return err
+	}
+	// The newaccount is meant for users using the CLI, since 'real' external
+	// UIs can use the UI-api instead. So we'll just use the native CLI UI here.
+	var (
+		ui                        = core.NewCommandlineUI()
+		pwStorage storage.Storage = &storage.NoStorage{}
+		ksLoc                     = c.GlobalString(keystoreFlag.Name)
+		lightKdf                  = c.GlobalBool(utils.LightKDFFlag.Name)
+	)
+	log.Info("Starting clef", "keystore", ksLoc, "light-kdf", lightKdf)
+	am := core.StartClefAccountManager(ksLoc, true, lightKdf, "")
+	// This gives is us access to the external API
+	apiImpl := core.NewSignerAPI(am, 0, true, ui, nil, false, pwStorage)
+	// This gives us access to the internal API
+	internalApi := core.NewUIServerAPI(apiImpl)
+	addr, err := internalApi.New(context.Background())
+	if err == nil {
+		fmt.Printf("Generated account %v\n", addr.String())
+	}
+	return err
+}
+
 func initialize(c *cli.Context) error {
 	// Set up the logger to print everything
 	logOutput := os.Stdout
 	if c.GlobalBool(stdiouiFlag.Name) {
 		logOutput = os.Stderr
 		// If using the stdioui, we can't do the 'confirm'-flow
-		fmt.Fprintf(logOutput, legalWarning)
-	} else {
+		if !c.GlobalBool(acceptFlag.Name) {
+			fmt.Fprint(logOutput, legalWarning)
+		}
+	} else if !c.GlobalBool(acceptFlag.Name) {
 		if !confirm(legalWarning) {
 			return fmt.Errorf("aborted by user")
 		}
 		fmt.Println()
 	}
-	log.Root().SetHandler(log.LvlFilterHandler(log.Lvl(c.Int(logLevelFlag.Name)), log.StreamHandler(logOutput, log.TerminalFormat(true))))
+	usecolor := (isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())) && os.Getenv("TERM") != "dumb"
+	output := io.Writer(logOutput)
+	if usecolor {
+		output = colorable.NewColorable(logOutput)
+	}
+	log.Root().SetHandler(log.LvlFilterHandler(log.Lvl(c.Int(logLevelFlag.Name)), log.StreamHandler(output, log.TerminalFormat(usecolor))))
+
 	return nil
+}
+
+// ipcEndpoint resolves an IPC endpoint based on a configured value, taking into
+// account the set data folders as well as the designated platform we're currently
+// running on.
+func ipcEndpoint(ipcPath, datadir string) string {
+	// On windows we can only use plain top-level pipes
+	if runtime.GOOS == "windows" {
+		if strings.HasPrefix(ipcPath, `\\.\pipe\`) {
+			return ipcPath
+		}
+		return `\\.\pipe\` + ipcPath
+	}
+	// Resolve names into the data directory full paths otherwise
+	if filepath.Base(ipcPath) == ipcPath {
+		if datadir == "" {
+			return filepath.Join(os.TempDir(), ipcPath)
+		}
+		return filepath.Join(datadir, ipcPath)
+	}
+	return ipcPath
 }
 
 func signer(c *cli.Context) error {
@@ -427,7 +587,6 @@ func signer(c *cli.Context) error {
 		api       core.ExternalAPI
 		pwStorage storage.Storage = &storage.NoStorage{}
 	)
-
 	configDir := c.GlobalString(configdirFlag.Name)
 	if stretchedKey, err := readMasterKey(c, ui); err != nil {
 		log.Warn("Failed to open master, rules disabled", "err", err)
@@ -505,31 +664,44 @@ func signer(c *cli.Context) error {
 			Service:   api,
 			Version:   "1.0"},
 	}
-	if c.GlobalBool(utils.RPCEnabledFlag.Name) {
-		vhosts := splitAndTrim(c.GlobalString(utils.RPCVirtualHostsFlag.Name))
-		cors := splitAndTrim(c.GlobalString(utils.RPCCORSDomainFlag.Name))
+	if c.GlobalBool(utils.HTTPEnabledFlag.Name) {
+		vhosts := utils.SplitAndTrim(c.GlobalString(utils.HTTPVirtualHostsFlag.Name))
+		cors := utils.SplitAndTrim(c.GlobalString(utils.HTTPCORSDomainFlag.Name))
+
+		srv := rpc.NewServer()
+		err := node.RegisterApisFromWhitelist(rpcAPI, []string{"account"}, srv, false)
+		if err != nil {
+			utils.Fatalf("Could not register API: %w", err)
+		}
+		handler := node.NewHTTPHandlerStack(srv, cors, vhosts)
+
+		// set port
+		port := c.Int(rpcPortFlag.Name)
+		if c.GlobalIsSet(legacyRPCPortFlag.Name) {
+			if !c.GlobalIsSet(rpcPortFlag.Name) {
+				port = c.Int(legacyRPCPortFlag.Name)
+			}
+			log.Warn("The flag --rpcport is deprecated and will be removed in the future, please use --http.port")
+		}
 
 		// start http server
-		httpEndpoint := fmt.Sprintf("%s:%d", c.GlobalString(utils.RPCListenAddrFlag.Name), c.Int(rpcPortFlag.Name))
-		listener, _, err := rpc.StartHTTPEndpoint(httpEndpoint, rpcAPI, []string{"account"}, cors, vhosts, rpc.DefaultHTTPTimeouts)
+		httpEndpoint := fmt.Sprintf("%s:%d", c.GlobalString(utils.HTTPListenAddrFlag.Name), port)
+		httpServer, addr, err := node.StartHTTPEndpoint(httpEndpoint, rpc.DefaultHTTPTimeouts, handler)
 		if err != nil {
 			utils.Fatalf("Could not start RPC api: %v", err)
 		}
-		extapiURL = fmt.Sprintf("http://%s", httpEndpoint)
+		extapiURL = fmt.Sprintf("http://%v/", addr)
 		log.Info("HTTP endpoint opened", "url", extapiURL)
 
 		defer func() {
-			listener.Close()
-			log.Info("HTTP endpoint closed", "url", httpEndpoint)
+			// Don't bother imposing a timeout here.
+			httpServer.Shutdown(context.Background())
+			log.Info("HTTP endpoint closed", "url", extapiURL)
 		}()
 	}
 	if !c.GlobalBool(utils.IPCDisabledFlag.Name) {
-		if c.IsSet(utils.IPCPathFlag.Name) {
-			ipcapiURL = c.GlobalString(utils.IPCPathFlag.Name)
-		} else {
-			ipcapiURL = filepath.Join(configDir, "clef.ipc")
-		}
-
+		givenPath := c.GlobalString(utils.IPCPathFlag.Name)
+		ipcapiURL = ipcEndpoint(filepath.Join(givenPath, "clef.ipc"), configDir)
 		listener, _, err := rpc.StartIPCEndpoint(ipcapiURL, rpcAPI)
 		if err != nil {
 			utils.Fatalf("Could not start IPC api: %v", err)
@@ -539,7 +711,6 @@ func signer(c *cli.Context) error {
 			listener.Close()
 			log.Info("IPC endpoint closed", "url", ipcapiURL)
 		}()
-
 	}
 
 	if c.GlobalBool(testFlag.Name) {
@@ -555,7 +726,7 @@ func signer(c *cli.Context) error {
 		},
 	})
 
-	abortChan := make(chan os.Signal)
+	abortChan := make(chan os.Signal, 1)
 	signal.Notify(abortChan, os.Interrupt)
 
 	sig := <-abortChan
@@ -564,21 +735,11 @@ func signer(c *cli.Context) error {
 	return nil
 }
 
-// splitAndTrim splits input separated by a comma
-// and trims excessive white space from the substrings.
-func splitAndTrim(input string) []string {
-	result := strings.Split(input, ",")
-	for i, r := range result {
-		result[i] = strings.TrimSpace(r)
-	}
-	return result
-}
-
 // DefaultConfigDir is the default config directory to use for the vaults and other
 // persistence requirements.
 func DefaultConfigDir() string {
 	// Try to place the data folder in the user's home dir
-	home := homeDir()
+	home := utils.HomeDir()
 	if home != "" {
 		if runtime.GOOS == "darwin" {
 			return filepath.Join(home, "Library", "Signer")
@@ -597,15 +758,6 @@ func DefaultConfigDir() string {
 	return ""
 }
 
-func homeDir() string {
-	if home := os.Getenv("HOME"); home != "" {
-		return home
-	}
-	if usr, err := user.Current(); err == nil {
-		return usr.HomeDir
-	}
-	return ""
-}
 func readMasterKey(ctx *cli.Context, ui core.UIClientAPI) ([]byte, error) {
 	var (
 		file      string
@@ -635,7 +787,7 @@ func readMasterKey(ctx *cli.Context, ui core.UIClientAPI) ([]byte, error) {
 		}
 		password = resp.Text
 	} else {
-		password = getPassPhrase("Decrypt master seed of clef", false)
+		password = utils.GetPassPhrase("Decrypt master seed of clef", false)
 	}
 	masterSeed, err := decryptSeed(cipherKey, password)
 	if err != nil {
@@ -670,7 +822,7 @@ func checkFile(filename string) error {
 
 // confirm displays a text and asks for user confirmation
 func confirm(text string) bool {
-	fmt.Printf(text)
+	fmt.Print(text)
 	fmt.Printf("\nEnter 'ok' to proceed:\n> ")
 
 	text, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -735,14 +887,13 @@ func testExternalUI(api *core.SignerAPI) {
 	{ // Sign data test - clique header
 		api.UI.ShowInfo("Please approve the next request for signing a clique header")
 		time.Sleep(delay)
-		cliqueHeader := &types.Header{
+		cliqueHeader := types.Header{
 			ParentHash:  common.HexToHash("0000H45H"),
 			UncleHash:   common.HexToHash("0000H45H"),
 			Coinbase:    common.HexToAddress("0000H45H"),
 			Root:        common.HexToHash("0000H00H"),
 			TxHash:      common.HexToHash("0000H45H"),
 			ReceiptHash: common.HexToHash("0000H45H"),
-			Bloom:       types.Bloom{},
 			Difficulty:  big.NewInt(1337),
 			Number:      big.NewInt(1337),
 			GasLimit:    1338,
@@ -750,7 +901,6 @@ func testExternalUI(api *core.SignerAPI) {
 			Time:        1338,
 			Extra:       []byte("Extra data Extra data Extra data  Extra data  Extra data  Extra data  Extra data Extra data"),
 			MixDigest:   common.HexToHash("0x0000H45H"),
-			Nonce:       types.BlockNonce{},
 		}
 		cliqueRlp, err := rlp.EncodeToBytes(cliqueHeader)
 		if err != nil {
@@ -767,8 +917,8 @@ func testExternalUI(api *core.SignerAPI) {
 		data := `{"types":{"EIP712Domain":[{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],"Person":[{"name":"name","type":"string"},{"name":"test","type":"uint8"},{"name":"wallet","type":"address"}],"Mail":[{"name":"from","type":"Person"},{"name":"to","type":"Person"},{"name":"contents","type":"string"}]},"primaryType":"Mail","domain":{"name":"Ether Mail","version":"1","chainId":"1","verifyingContract":"0xCCCcccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"},"message":{"from":{"name":"Cow","test":"3","wallet":"0xcD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826"},"to":{"name":"Bob","wallet":"0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB","test":"2"},"contents":"Hello, Bob!"}}`
 		//_, err := api.SignData(ctx, accounts.MimetypeTypedData, *addr, hexutil.Encode([]byte(data)))
 		var typedData core.TypedData
-		err := json.Unmarshal([]byte(data), &typedData)
-		_, err = api.SignTypedData(ctx, *addr, typedData)
+		json.Unmarshal([]byte(data), &typedData)
+		_, err := api.SignTypedData(ctx, *addr, typedData)
 		expectApprove("sign 712 typed data", err)
 	}
 	{ // Sign data test - plain text
@@ -832,27 +982,6 @@ func testExternalUI(api *core.SignerAPI) {
 
 }
 
-// getPassPhrase retrieves the password associated with clef, either fetched
-// from a list of preloaded passphrases, or requested interactively from the user.
-// TODO: there are many `getPassPhrase` functions, it will be better to abstract them into one.
-func getPassPhrase(prompt string, confirmation bool) string {
-	fmt.Println(prompt)
-	password, err := console.Stdin.PromptPassword("Passphrase: ")
-	if err != nil {
-		utils.Fatalf("Failed to read passphrase: %v", err)
-	}
-	if confirmation {
-		confirm, err := console.Stdin.PromptPassword("Repeat passphrase: ")
-		if err != nil {
-			utils.Fatalf("Failed to read passphrase confirmation: %v", err)
-		}
-		if password != confirm {
-			utils.Fatalf("Passphrases do not match")
-		}
-	}
-	return password
-}
-
 type encryptedSeedStorage struct {
 	Description string              `json:"description"`
 	Version     int                 `json:"version"`
@@ -903,7 +1032,7 @@ func GenDoc(ctx *cli.Context) {
 			if data, err := json.MarshalIndent(v, "", "  "); err == nil {
 				output = append(output, fmt.Sprintf("### %s\n\n%s\n\nExample:\n```json\n%s\n```", name, desc, data))
 			} else {
-				log.Error("Error generating output", err)
+				log.Error("Error generating output", "err", err)
 			}
 		}
 	)
@@ -914,7 +1043,7 @@ func GenDoc(ctx *cli.Context) {
 			"of the work in canonicalizing and making sense of the data, and it's up to the UI to present" +
 			"the user with the contents of the `message`"
 		sighash, msg := accounts.TextAndHash([]byte("hello world"))
-		messages := []*core.NameValueType{{"message", msg, accounts.MimetypeTextPlain}}
+		messages := []*core.NameValueType{{Name: "message", Value: msg, Typ: accounts.MimetypeTextPlain}}
 
 		add("SignDataRequest", desc, &core.SignDataRequest{
 			Address:     common.NewMixedcaseAddress(a),
@@ -945,8 +1074,8 @@ func GenDoc(ctx *cli.Context) {
 		add("SignTxRequest", desc, &core.SignTxRequest{
 			Meta: meta,
 			Callinfo: []core.ValidationInfo{
-				{"Warning", "Something looks odd, show this message as a warning"},
-				{"Info", "User should see this aswell"},
+				{Typ: "Warning", Message: "Something looks odd, show this message as a warning"},
+				{Typ: "Info", Message: "User should see this as well"},
 			},
 			Transaction: core.SendTxArgs{
 				Data:     &data,
@@ -1012,16 +1141,21 @@ func GenDoc(ctx *cli.Context) {
 			&core.ListRequest{
 				Meta: meta,
 				Accounts: []accounts.Account{
-					{a, accounts.URL{Scheme: "keystore", Path: "/path/to/keyfile/a"}},
-					{b, accounts.URL{Scheme: "keystore", Path: "/path/to/keyfile/b"}}},
+					{Address: a, URL: accounts.URL{Scheme: "keystore", Path: "/path/to/keyfile/a"}},
+					{Address: b, URL: accounts.URL{Scheme: "keystore", Path: "/path/to/keyfile/b"}}},
 			})
 
 		add("ListResponse", "Response to list request. The response contains a list of all addresses to show to the caller. "+
 			"Note: the UI is free to respond with any address the caller, regardless of whether it exists or not",
 			&core.ListResponse{
 				Accounts: []accounts.Account{
-					{common.HexToAddress("0xcowbeef000000cowbeef00000000000000000c0w"), accounts.URL{Path: ".. ignored .."}},
-					{common.HexToAddress("0xffffffffffffffffffffffffffffffffffffffff"), accounts.URL{}},
+					{
+						Address: common.HexToAddress("0xcowbeef000000cowbeef00000000000000000c0w"),
+						URL:     accounts.URL{Path: ".. ignored .."},
+					},
+					{
+						Address: common.HexToAddress("0xffffffffffffffffffffffffffffffffffffffff"),
+					},
 				}})
 	}
 

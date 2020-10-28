@@ -494,22 +494,6 @@ func (t *dialTask) run(d *dialScheduler) {
 			}
 		}
 	}
-	if err == nil {
-		err = t.dial(srv, t.dest)
-		if err != nil {
-			// Try resolving the ID of static nodes if dialing failed.
-			if _, ok := err.(*dialError); ok && t.flags&staticDialedConn != 0 {
-				if t.resolve(srv) {
-					err = t.dial(srv, t.dest)
-				}
-			}
-		}
-		if err == nil {
-			log.Trace("Dial pair connection success", "task", t.dest)
-		} else {
-			log.Trace("Dial pair connection error", "task", t.dest, "err", err)
-		}
-	}
 }
 
 func (t *dialTask) needResolve() bool {

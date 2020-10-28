@@ -19,6 +19,7 @@ package types
 import (
 	"container/heap"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"sync/atomic"
@@ -34,15 +35,16 @@ import (
 
 var (
 	ErrInvalidSig = errors.New("invalid transaction v, r, s values")
+	errNoSigner   = errors.New("missing signing methods")
 )
 
-// TODO: do later here
 // deriveSigner makes a *best* guess about which signer to use.
 func deriveSigner(V *big.Int) Signer {
 	if V.Sign() != 0 && isProtectedV(V) {
 		return NewEIP155Signer(deriveChainId(V))
+	} else {
+		return HomesteadSigner{}
 	}
-	return HomesteadSigner{}
 }
 
 type Transaction struct {
@@ -133,7 +135,7 @@ func isProtectedV(V *big.Int) bool {
 		v := V.Uint64()
 		return v != 27 && v != 28
 	}
-	// anything not 27 or 28 is considered protected
+	// anything not 27 or 28 are considered unprotected
 	return true
 }
 
@@ -167,18 +169,15 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 	if err := dec.UnmarshalJSON(input); err != nil {
 		return err
 	}
-	withSignature := dec.V.Sign() != 0 || dec.R.Sign() != 0 || dec.S.Sign() != 0
-	if withSignature {
-		var V byte
-		if isProtectedV(dec.V) {
-			chainID := deriveChainId(dec.V).Uint64()
-			V = byte(dec.V.Uint64() - 35 - 2*chainID)
-		} else {
-			V = byte(dec.V.Uint64() - 27)
-		}
-		if !crypto.ValidateSignatureValues(V, dec.R, dec.S, false) {
-			return ErrInvalidSig
-		}
+	var V byte
+	if isProtectedV(dec.V) {
+		chainID := deriveChainId(dec.V).Uint64()
+		V = byte(dec.V.Uint64() - 35 - 2*chainID)
+	} else {
+		V = byte(dec.V.Uint64() - 27)
+	}
+	if !crypto.ValidateSignatureValues(V, dec.R, dec.S, false) {
+		return ErrInvalidSig
 	}
 	*tx = Transaction{
 		data: dec,
@@ -190,15 +189,16 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 func (tx *Transaction) Data() []byte       { return common.CopyBytes(tx.data.Payload) }
 func (tx *Transaction) Gas() uint64        { return tx.data.GasLimit }
 func (tx *Transaction) GasPrice() *big.Int { return new(big.Int).Set(tx.data.Price) }
+
 func (tx *Transaction) GasPriceCmp(other *Transaction) int {
 	return tx.data.Price.Cmp(other.data.Price)
 }
 func (tx *Transaction) GasPriceIntCmp(other *big.Int) int {
 	return tx.data.Price.Cmp(other)
 }
-func (tx *Transaction) Value() *big.Int  { return new(big.Int).Set(tx.data.Amount) }
-func (tx *Transaction) Nonce() uint64    { return tx.data.AccountNonce }
-func (tx *Transaction) CheckNonce() bool { return true }
+func (tx *Transaction) Value() *big.Int    { return new(big.Int).Set(tx.data.Amount) }
+func (tx *Transaction) Nonce() uint64      { return tx.data.AccountNonce }
+func (tx *Transaction) CheckNonce() bool   { return true }
 
 // To returns the recipient address of the transaction.
 // It returns nil if the transaction is a contract creation.
@@ -210,17 +210,17 @@ func (tx *Transaction) To() *common.Address {
 	return &to
 }
 
-// TODO: do later here
 func (tx *Transaction) From() *common.Address {
 	if tx.data.V != nil {
 		signer := deriveSigner(tx.data.V)
-		f, err := Sender(signer, tx)
-		if err != nil {
+		if f, err := Sender(signer, tx); err != nil {
 			return nil
+		} else {
+			return &f
 		}
-		return &f
+	} else {
+		return nil
 	}
-	return nil
 }
 
 // Hash hashes the RLP encoding of tx.
@@ -273,7 +273,7 @@ func (tx *Transaction) AsMessage(s Signer) (Message, error) {
 }
 
 // WithSignature returns a new transaction with the given signature.
-// This signature needs to be in the [R || S || V] format where V is 0 or 1.
+// This signature needs to be formatted as described in the yellow paper (v+27).
 func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, error) {
 	r, s, v, err := signer.SignatureValues(tx, sig)
 	if err != nil {
@@ -294,9 +294,7 @@ func (tx *Transaction) Cost() *big.Int {
 	return total
 }
 
-// RawSignatureValues returns the V, R, S signature values of the transaction.
-// The return values should not be modified by the caller.
-func (tx *Transaction) RawSignatureValues() (v, r, s *big.Int) {
+func (tx *Transaction) RawSignatureValues() (*big.Int, *big.Int, *big.Int) {
 	return tx.data.V, tx.data.R, tx.data.S
 }
 
@@ -367,58 +365,57 @@ func (tx *Transaction) IsVotingTransaction() (bool, *common.Address) {
 	return b, nil
 }
 
-// TODO: do later here
-// func (tx *Transaction) String() string {
-// 	var from, to string
-// 	if tx.data.V != nil {
-// 		// make a best guess about the signer and use that to derive
-// 		// the sender.
-// 		signer := deriveSigner(tx.data.V)
-// 		if f, err := Sender(signer, tx); err != nil { // derive but don't cache
-// 			from = "[invalid sender: invalid sig]"
-// 		} else {
-// 			from = fmt.Sprintf("%x", f[:])
-// 		}
-// 	} else {
-// 		from = "[invalid sender: nil V field]"
-// 	}
+func (tx *Transaction) String() string {
+	var from, to string
+	if tx.data.V != nil {
+		// make a best guess about the signer and use that to derive
+		// the sender.
+		signer := deriveSigner(tx.data.V)
+		if f, err := Sender(signer, tx); err != nil { // derive but don't cache
+			from = "[invalid sender: invalid sig]"
+		} else {
+			from = fmt.Sprintf("%x", f[:])
+		}
+	} else {
+		from = "[invalid sender: nil V field]"
+	}
 
-// 	if tx.data.Recipient == nil {
-// 		to = "[contract creation]"
-// 	} else {
-// 		to = fmt.Sprintf("%x", tx.data.Recipient[:])
-// 	}
-// 	enc, _ := rlp.EncodeToBytes(&tx.data)
-// 	return fmt.Sprintf(`
-// 	TX(%x)
-// 	Contract: %v
-// 	From:     %s
-// 	To:       %s
-// 	Nonce:    %v
-// 	GasPrice: %#x
-// 	GasLimit  %#x
-// 	Value:    %#x
-// 	Data:     0x%x
-// 	V:        %#x
-// 	R:        %#x
-// 	S:        %#x
-// 	Hex:      %x
-// `,
-// 		tx.Hash(),
-// 		tx.data.Recipient == nil,
-// 		from,
-// 		to,
-// 		tx.data.AccountNonce,
-// 		tx.data.Price,
-// 		tx.data.GasLimit,
-// 		tx.data.Amount,
-// 		tx.data.Payload,
-// 		tx.data.V,
-// 		tx.data.R,
-// 		tx.data.S,
-// 		enc,
-// 	)
-// }
+	if tx.data.Recipient == nil {
+		to = "[contract creation]"
+	} else {
+		to = fmt.Sprintf("%x", tx.data.Recipient[:])
+	}
+	enc, _ := rlp.EncodeToBytes(&tx.data)
+	return fmt.Sprintf(`
+	TX(%x)
+	Contract: %v
+	From:     %s
+	To:       %s
+	Nonce:    %v
+	GasPrice: %#x
+	GasLimit  %#x
+	Value:    %#x
+	Data:     0x%x
+	V:        %#x
+	R:        %#x
+	S:        %#x
+	Hex:      %x
+`,
+		tx.Hash(),
+		tx.data.Recipient == nil,
+		from,
+		to,
+		tx.data.AccountNonce,
+		tx.data.Price,
+		tx.data.GasLimit,
+		tx.data.Amount,
+		tx.data.Payload,
+		tx.data.V,
+		tx.data.R,
+		tx.data.S,
+		enc,
+	)
+}
 
 // Transactions is a Transaction slice type for basic sorting.
 type Transactions []*Transaction
@@ -435,9 +432,9 @@ func (s Transactions) GetRlp(i int) []byte {
 	return enc
 }
 
-// TxDifference returns a new set which is the difference between a and b.
-func TxDifference(a, b Transactions) Transactions {
-	keep := make(Transactions, 0, len(a))
+// TxDifference returns a new set t which is the difference between a to b.
+func TxDifference(a, b Transactions) (keep Transactions) {
+	keep = make(Transactions, 0, len(a))
 
 	remove := make(map[common.Hash]struct{})
 	for _, tx := range b {
@@ -467,6 +464,7 @@ func (s TxByNonce) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 type TxByPriceAndTime Transactions
 
 func (s TxByPriceAndTime) Len() int { return len(s) }
+// func (s TxByPriceAndTime) Less(i, j int) bool { return s[i].data.Price.Cmp(s[j].data.Price) > 0 }
 func (s TxByPriceAndTime) Less(i, j int) bool {
 	// If the prices are equal, use the time the transaction was first seen for
 	// deterministic sorting
@@ -504,9 +502,14 @@ type TransactionsByPriceAndNonce struct {
 //
 // Note, the input map is reowned so the caller should not interact any more with
 // if after providing it to the constructor.
-func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions) *TransactionsByPriceAndNonce {
-	// Initialize a price and received time based heap with the head transactions
+
+// It also classifies special txs and normal txs
+func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, signers map[common.Address]struct{}) (*TransactionsByPriceAndNonce, Transactions) {
+	// Initialize a price based heap with the head transactions
+	// heads := TxByPriceAndTime{}
 	heads := make(TxByPriceAndTime, 0, len(txs))
+
+	specialTxs := Transactions{}
 	for from, accTxs := range txs {
 		heads = append(heads, accTxs[0])
 		// Ensure the sender address is from the signer

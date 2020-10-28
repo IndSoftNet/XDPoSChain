@@ -36,7 +36,7 @@ import (
 var Memsize memsizeui.Handler
 
 var (
-	VerbosityFlag = cli.IntFlag{
+	verbosityFlag = cli.IntFlag{
 		Name:  "verbosity",
 		Usage: "Logging verbosity: 0=silent, 1=error, 2=warn, 3=info, 4=debug, 5=detail",
 		Value: 3,
@@ -126,7 +126,7 @@ var DeprecatedFlags = []cli.Flag{
 
 var (
 	ostream log.Handler
-	Glogger *log.GlogHandler
+	glogger *log.GlogHandler
 )
 
 func init() {
@@ -136,7 +136,7 @@ func init() {
 		output = colorable.NewColorableStderr()
 	}
 	ostream = log.StreamHandler(output, log.TerminalFormat(usecolor))
-	Glogger = log.NewGlogHandler(ostream)
+	glogger = log.NewGlogHandler(ostream)
 }
 
 // Setup initializes profiling and logging based on the CLI flags.

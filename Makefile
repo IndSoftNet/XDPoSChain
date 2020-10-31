@@ -1,6 +1,12 @@
-.PHONY: XDC XDC-cross evm all test clean
+# This Makefile is meant to be used by people that do not usually work
+# with Go source code. If you know what GOPATH is then you probably
+# don't need to bother with make.
+
+.PHONY: XDC android ios XDC-cross evm all test clean
 .PHONY: XDC-linux XDC-linux-386 XDC-linux-amd64 XDC-linux-mips64 XDC-linux-mips64le
+.PHONY: XDC-linux-arm XDC-linux-arm-5 XDC-linux-arm-6 XDC-linux-arm-7 XDC-linux-arm64
 .PHONY: XDC-darwin XDC-darwin-386 XDC-darwin-amd64
+.PHONY: XDC-windows XDC-windows-386 XDC-windows-amd64
 
 GOBIN = ./build/bin
 GO ?= latest
@@ -23,24 +29,8 @@ android:
 	
 ios:
 	$(GORUN) build/ci.go xcode --local
-
-gc:
-	build/env.sh go run build/ci.go install ./cmd/gc
 	@echo "Done building."
-	@echo "Run \"$(GOBIN)/gc\" to launch gc."
-
-bootnode:
-	build/env.sh go run build/ci.go install ./cmd/bootnode
-	@echo "Done building."
-	@echo "Run \"$(GOBIN)/bootnode\" to launch a bootnode."
-
-puppeth:
-	build/env.sh go run build/ci.go install ./cmd/puppeth
-	@echo "Done building."
-	@echo "Run \"$(GOBIN)/puppeth\" to launch puppeth."
-
-all:
-	build/env.sh go run build/ci.go install
+	@echo "Import \"$(GOBIN)/XDC.framework\" to use the library."
 
 test: all
 	$(GORUN) build/ci.go test
@@ -52,13 +42,26 @@ clean:
 	env GO111MODULE=on go clean -cache
 	rm -fr build/_workspace/pkg/ $(GOBIN)/*
 
+# The devtools target installs tools required for 'go generate'.
+# You need to put $GOBIN (or $GOPATH/bin) in your PATH to use 'go generate'.
+
+devtools:
+	env GOBIN= go get -u golang.org/x/tools/cmd/stringer
+	env GOBIN= go get -u github.com/kevinburke/go-bindata/go-bindata
+	env GOBIN= go get -u github.com/fjl/gencodec
+	env GOBIN= go get -u github.com/golang/protobuf/protoc-gen-go
+	env GOBIN= go install ./cmd/abigen
+	@type "npm" 2> /dev/null || echo 'Please install node.js and npm'
+	@type "solc" 2> /dev/null || echo 'Please install solc'
+	@type "protoc" 2> /dev/null || echo 'Please install protoc'
+
 # Cross Compilation Targets (xgo)
 
-XDC-cross: XDC-linux XDC-darwin
+XDC-cross: XDC-linux XDC-darwin XDC-windows XDC-android XDC-ios
 	@echo "Full cross compilation done:"
 	@ls -ld $(GOBIN)/XDC-*
 
-XDC-linux: XDC-linux-386 XDC-linux-amd64 XDC-linux-mips64 XDC-linux-mips64le
+XDC-linux: XDC-linux-386 XDC-linux-amd64 XDC-linux-arm XDC-linux-mips64 XDC-linux-mips64le
 	@echo "Linux cross compilation done:"
 	@ls -ld $(GOBIN)/XDC-linux-*
 

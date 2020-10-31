@@ -34,8 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/naoina/toml"
 
-	bzzapi "github.com/ethereum/go-ethereum/swarm/api"
-)
+	)
 
 var (
 	//flag definition for the dumpconfig command

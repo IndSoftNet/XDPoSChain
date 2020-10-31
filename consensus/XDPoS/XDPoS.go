@@ -18,7 +18,7 @@
 package XDPoS
 
 import (
-	"bytes"
+	"bytes"	
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +46,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/go-ethereum/trie"
 	lru "github.com/hashicorp/golang-lru"
 	"golang.org/x/crypto/sha3"
 )
@@ -952,7 +953,10 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainReader, header *types.H
 	header.UncleHash = types.CalcUncleHash(nil)
 
 	// Assemble and return the final block for sealing
-	return types.NewBlock(header, txs, nil, receipts), nil
+	// TODO OG
+	// return types.NewBlock(header, txs, nil, receipts), nil 
+	return types.NewBlock(header, txs, nil, receipts, new(trie.Trie)), nil
+
 }
 
 // Authorize injects a private key into the consensus engine to mint new blocks

@@ -462,40 +462,6 @@ func runRandTest(rt randTest) bool {
 	return true
 }
 
-func checkCacheInvariant(n, parent Node, parentCachegen uint16, parentDirty bool, depth int) error {
-	var children []Node
-	var flag nodeFlag
-	switch n := n.(type) {
-	case *ShortNode:
-		flag = n.flags
-		children = []Node{n.Val}
-	case *FullNode:
-		flag = n.flags
-		children = n.Children[:]
-	default:
-		return nil
-	}
-
-	errorf := func(format string, args ...interface{}) error {
-		msg := fmt.Sprintf(format, args...)
-		msg += fmt.Sprintf("\nat depth %d node %s", depth, spew.Sdump(n))
-		msg += fmt.Sprintf("parent: %s", spew.Sdump(parent))
-		return errors.New(msg)
-	}
-	if flag.gen > parentCachegen {
-		return errorf("cache invariant violation: %d > %d\n", flag.gen, parentCachegen)
-	}
-	if depth > 0 && !parentDirty && flag.dirty {
-		return errorf("cache invariant violation: %d > %d\n", flag.gen, parentCachegen)
-	}
-	for _, child := range children {
-		if err := checkCacheInvariant(child, n, flag.gen, flag.dirty, depth+1); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func TestRandom(t *testing.T) {
 	if err := quick.Check(runRandTest, nil); err != nil {
 		if cerr, ok := err.(*quick.CheckError); ok {

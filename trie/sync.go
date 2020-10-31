@@ -358,7 +358,7 @@ func (s *Sync) schedule(req *request) {
 
 // children retrieves all the missing children of a state trie entry for future
 // retrieval scheduling.
-func (s *Sync) children(req *request, object Node) ([]*request, error) {
+func (s *Sync) children(req *request, object node) ([]*request, error) {
 	// Gather all the children of the node, irrelevant whether known or not
 	type child struct {
 		path []byte
@@ -376,7 +376,7 @@ func (s *Sync) children(req *request, object Node) ([]*request, error) {
 			node: node.Val,
 			path: append(append([]byte(nil), req.path...), key...),
 		}}
-	case *FullNode:
+	case *fullNode:
 		for i := 0; i < 17; i++ {
 			if node.Children[i] != nil {
 				children = append(children, child{
@@ -400,7 +400,7 @@ func (s *Sync) children(req *request, object Node) ([]*request, error) {
 			}
 		}
 		// If the child references another node, resolve or schedule
-		if node, ok := (child.node).(HashNode); ok {
+		if node, ok := (child.node).(hashNode); ok {
 			// Try to resolve the node from the local database
 			hash := common.BytesToHash(node)
 			if s.membatch.hasNode(hash) {

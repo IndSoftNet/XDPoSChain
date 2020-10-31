@@ -38,11 +38,11 @@ import (
 func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) error {
 	// Collect all nodes on the path to key.
 	key = keybytesToHex(key)
-	var nodes []Node
+	var nodes []node
 	tn := t.root
 	for len(key) > 0 && tn != nil {
 		switch n := tn.(type) {
-		case *ShortNode:
+		case *shortNode:
 			if len(key) < len(n.Key) || !bytes.Equal(n.Key, key[:len(n.Key)]) {
 				// The trie doesn't contain the key.
 				tn = nil
@@ -51,11 +51,11 @@ func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) e
 				key = key[len(n.Key):]
 			}
 			nodes = append(nodes, n)
-		case *FullNode:
+		case *fullNode:
 			tn = n.Children[key[0]]
 			key = key[1:]
 			nodes = append(nodes, n)
-		case HashNode:
+		case hashNode:
 			var err error
 			tn, err = t.resolveHash(n, nil)
 			if err != nil {
@@ -554,7 +554,7 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 func get(tn node, key []byte, skipResolved bool) ([]byte, node) {
 	for {
 		switch n := tn.(type) {
-		case *ShortNode:
+		case *shortNode:
 			if len(key) < len(n.Key) || !bytes.Equal(n.Key, key[:len(n.Key)]) {
 				return nil, nil
 			}
@@ -573,7 +573,7 @@ func get(tn node, key []byte, skipResolved bool) ([]byte, node) {
 			return key, n
 		case nil:
 			return key, nil
-		case ValueNode:
+		case valueNode:
 			return nil, n
 		default:
 			panic(fmt.Sprintf("%T: invalid node: %v", tn, tn))

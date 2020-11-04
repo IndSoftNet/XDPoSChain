@@ -18,8 +18,11 @@
 
 /*
 The ci command is called from Continuous Integration scripts.
+
 Usage: go run build/ci.go <command> <command flags/arguments>
+
 Available commands are:
+
    install    [ -arch architecture ] [ -cc compiler ] [ packages... ]                          -- builds packages and executables
    test       [ -coverage ] [ packages... ]                                                    -- runs the tests
    lint                                                                                        -- runs certain pre-selected linters
@@ -31,7 +34,9 @@ Available commands are:
    xcode      [ -local ] [ -sign key-id ] [-deploy repo] [ -upload dest ]                      -- creates an iOS XCode framework
    xgo        [ -alltools ] [ options ]                                                        -- cross builds according to options
    purge      [ -store blobstore ] [ -days threshold ]                                         -- purges old archives from the blobstore
+
 For all commands, -n prevents execution of external programs (dry run mode).
+
 */
 package main
 
@@ -209,7 +214,6 @@ func doInstall(cmdline []string) {
 	if flag.NArg() > 0 {
 		packages = flag.Args()
 	}
-	packages = build.ExpandPackagesNoVendor(packages)
 
 	if *arch == "" || *arch == runtime.GOARCH {
 		goinstall := goTool("install", buildFlags(env)...)
@@ -306,7 +310,6 @@ func doTest(cmdline []string) {
 	if len(flag.CommandLine.Args()) > 0 {
 		packages = flag.CommandLine.Args()
 	}
-	packages = build.ExpandPackagesNoVendor(packages)
 
 	// Run the actual tests.
 	// Test a single package at a time. CI builders are slow

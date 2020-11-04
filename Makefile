@@ -2,8 +2,7 @@
 .PHONY: XDC-linux XDC-linux-386 XDC-linux-amd64 XDC-linux-mips64 XDC-linux-mips64le
 .PHONY: XDC-darwin XDC-darwin-386 XDC-darwin-amd64
 
-GOBIN = $(shell pwd)/build/bin
-GOFMT = gofmt
+GOBIN = ./build/bin
 GO ?= latest
 GO_PACKAGES = .
 GO_FILES := $(shell find $(shell go list -f '{{.Dir}}' $(GO_PACKAGES)) -name \*.go)

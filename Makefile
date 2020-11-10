@@ -36,6 +36,9 @@ all:
 test: all
 	build/env.sh go run build/ci.go test
 
+lint: ## Run linters.
+	build/env.sh go run build/ci.go lint
+
 clean:
 	rm -fr build/_workspace/pkg/ $(GOBIN)/*
 

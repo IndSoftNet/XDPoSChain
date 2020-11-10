@@ -152,7 +152,7 @@ func init() {
 	// Initialize the CLI app and start XDC
 	app.Action = XDC
 	app.HideVersion = true // we have a command to print the version
-	app.Copyright = "Copyright (c) 2018 XDCchain"
+	app.Copyright = "Copyright 2017-2020 The XDC.Network Authors"
 	app.Commands = []cli.Command{
 		// See chaincmd.go:
 		initCommand,

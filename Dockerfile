@@ -9,11 +9,5 @@ FROM alpine:latest
 
 LABEL maintainer="anil@xinfin.org"
 
-RUN addgroup -g 1000 XDC && \
-    adduser -h /root -D -u 1000 -G XDC XDC && \
-    chown XDC:XDC /root
-
-USER XDC
-
-EXPOSE 8545 8546 30303 30303/udp 30304/udp
+EXPOSE 8545 8546 30303 30303/udp
 ENTRYPOINT ["XDC"]

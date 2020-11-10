@@ -9,15 +9,11 @@ FROM alpine:latest
 
 LABEL maintainer="anil@xinfin.org"
 
-WORKDIR /XDCchain
+RUN addgroup -g 1000 XDC && \
+    adduser -h /root -D -u 1000 -G XDC XDC && \
+    chown XDC:XDC /root
 
-COPY --from=builder /XDCchain/build/bin/XDC /usr/local/bin/XDC
+USER XDC
 
-RUN chmod +x /usr/local/bin/XDC
-
-EXPOSE 8545
-EXPOSE 30303
-
-ENTRYPOINT ["/usr/local/bin/XDC"]
-
-CMD ["--help"]
+EXPOSE 8545 8546 30303 30303/udp 30304/udp
+ENTRYPOINT ["XDC"]

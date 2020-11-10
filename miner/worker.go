@@ -46,7 +46,7 @@ const (
 	resultQueueSize  = 10
 	miningLogAtDepth = 5
 
-	// txChanSize is the size of channel listening to TxPreEvent.
+	// txChanSize is the size of channel listening to NewTxsEvent.
 	// The number is referenced from the size of tx pool.
 	txChanSize = 4096
 	// chainHeadChanSize is the size of channel listening to ChainHeadEvent.
@@ -79,6 +79,7 @@ type Work struct {
 	family    *set.Set       // family set (used for checking uncle invalidity)
 	uncles    *set.Set       // uncle set
 	tcount    int            // tx count in cycle
+	gasPool   *core.GasPool  // available gas used to pack transactions
 
 	Block *types.Block // the new block
 
@@ -103,8 +104,8 @@ type worker struct {
 
 	// update loop
 	mux          *event.TypeMux
-	txCh         chan core.TxPreEvent
-	txSub        event.Subscription
+	txsCh        chan core.NewTxsEvent
+	txsSub       event.Subscription
 	chainHeadCh  chan core.ChainHeadEvent
 	chainHeadSub event.Subscription
 	chainSideCh  chan core.ChainSideEvent
@@ -147,7 +148,7 @@ func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase com
 		engine:         engine,
 		eth:            eth,
 		mux:            mux,
-		txCh:           make(chan core.TxPreEvent, txChanSize),
+		txsCh:          make(chan core.NewTxsEvent, txChanSize),
 		chainHeadCh:    make(chan core.ChainHeadEvent, chainHeadChanSize),
 		chainSideCh:    make(chan core.ChainSideEvent, chainSideChanSize),
 		chainDb:        eth.ChainDb(),
@@ -162,8 +163,10 @@ func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase com
 	}
 	if worker.announceTxs {
 		// Subscribe TxPreEvent for tx pool
-		worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh)
+		worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
 	}
+	// Subscribe NewTxsEvent for tx pool
+	worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
 	// Subscribe events for blockchain
 	worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh)
 	worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh)
@@ -254,9 +257,7 @@ func (self *worker) unregister(agent Agent) {
 }
 
 func (self *worker) update() {
-	if self.announceTxs {
-		defer self.txSub.Unsubscribe()
-	}
+	defer self.txsSub.Unsubscribe()
 	defer self.chainHeadSub.Unsubscribe()
 	defer self.chainSideSub.Unsubscribe()
 	timeout := time.NewTimer(waitPeriod * time.Second)
@@ -296,15 +297,23 @@ func (self *worker) update() {
 				self.uncleMu.Unlock()
 			}
 			// Handle TxPreEvent
-		case ev := <-self.txCh:
-			// Apply transaction to the pending state if we're not mining
+
+		// Handle NewTxsEvent
+		case ev := <-self.txsCh:
+			// Apply transactions to the pending state if we're not mining.
+			//
+			// Note all transactions received may not be continuous with transactions
+			// already included in the current mining block. These transactions will
+			// be automatically eliminated.
 			if atomic.LoadInt32(&self.mining) == 0 {
 				self.currentMu.Lock()
-				acc, _ := types.Sender(self.current.signer, ev.Tx)
-				txs := map[common.Address]types.Transactions{acc: {ev.Tx}}
-				txset, specialTxs := types.NewTransactionsByPriceAndNonce(self.current.signer, txs, nil)
-
-				self.current.commitTransactions(self.mux, txset, specialTxs, self.chain, self.coinbase)
+				txs := make(map[common.Address]types.Transactions)
+				for _, tx := range ev.Txs {
+					acc, _ := types.Sender(self.current.signer, tx)
+					txs[acc] = append(txs[acc], tx)
+				}
+				txset, specialTxs := types.NewTransactionsByPriceAndNonce(self.current.signer, txs,nil)
+				self.current.commitTransactions(self.mux, txset,specialTxs, self.chain, self.coinbase)
 				self.updateSnapshot()
 				self.currentMu.Unlock()
 			} else {
@@ -313,6 +322,10 @@ func (self *worker) update() {
 					self.commitNewWork()
 				}
 			}
+
+		// System stopped
+		case <-self.txsSub.Err():
+			return
 		case <-self.chainHeadSub.Err():
 			return
 		case <-self.chainSideSub.Err():
@@ -670,13 +683,15 @@ func (self *worker) updateSnapshot() {
 }
 
 func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsByPriceAndNonce,specialTxs types.Transactions, bc *core.BlockChain, coinbase common.Address) {
-	gp := new(core.GasPool).AddGas(env.header.GasLimit)
+	if env.gasPool == nil {
+		env.gasPool = new(core.GasPool).AddGas(env.header.GasLimit)
+	}
 
 	var coalescedLogs []*types.Log
 	// first priority for special Txs
 	for _, tx := range specialTxs {
-		if gp.Gas() < params.TxGas && tx.Gas() > 0 {
-			log.Trace("Not enough gas for further transactions", "gp", gp)
+		if env.gasPool.Gas() < params.TxGas && tx.Gas() > 0 {
+			log.Trace("Not enough gas for further transactions", "gp", env.gasPool)
 			break
 		}
 		// Error may be ignored here. The error has already been checked
@@ -708,7 +723,7 @@ func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsB
 			log.Trace("Skipping account with special transaction invalide nonce", "sender", from, "nonce", nonce, "tx nonce ", tx.Nonce(), "to", tx.To())
 			continue
 		}
-		err, logs := env.commitTransaction(tx, bc, coinbase, gp)
+		err, logs := env.commitTransaction(tx, bc, coinbase, env.gasPool)
 		switch err {
 		case core.ErrNonceTooLow:
 			// New head notification data race between the transaction pool and miner, shift
@@ -730,8 +745,8 @@ func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsB
 	}
 	for {
 		// If we don't have enough gas for any further transactions then we're done
-		if gp.Gas() < params.TxGas {
-			log.Trace("Not enough gas for further transactions", "gp", gp)
+		if env.gasPool.Gas() < params.TxGas {
+			log.Trace("Not enough gas for further transactions", "have", env.gasPool, "want", params.TxGas)
 			break
 		}
 		if txs == nil {
@@ -757,20 +772,8 @@ func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsB
 		}
 		// Start executing the transaction
 		env.state.Prepare(tx.Hash(), common.Hash{}, env.tcount)
-		nonce := env.state.GetNonce(from)
-		if nonce > tx.Nonce() {
-			// New head notification data race between the transaction pool and miner, shift
-			log.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
-			txs.Shift()
-			continue
-		}
-		if nonce < tx.Nonce() {
-			// Reorg notification data race between the transaction pool and miner, skip account =
-			log.Trace("Skipping account with hight nonce", "sender", from, "nonce", tx.Nonce())
-			txs.Pop()
-			continue
-		}
-		err, logs := env.commitTransaction(tx, bc, coinbase, gp)
+
+		err, logs := env.commitTransaction(tx, bc, coinbase, env.gasPool)
 		switch err {
 		case core.ErrGasLimitReached:
 			// Pop the current out-of-gas transaction without shifting in the next from the account

@@ -196,10 +196,15 @@ func init() {
 
 	app.Before = func(ctx *cli.Context) error {
 		runtime.GOMAXPROCS(runtime.NumCPU())
-		if err := debug.Setup(ctx); err != nil {
+
+		logdir := ""
+		if ctx.GlobalBool(utils.DashboardEnabledFlag.Name) {
+			logdir = (&node.Config{DataDir: utils.MakeDataDir(ctx)}).ResolvePath("logs")
+		}
+		if err := debug.Setup(ctx, logdir); err != nil {
 			return err
 		}
-		// Cap the cache allowance and tune the garbage colelctor
+		// Cap the cache allowance and tune the garbage collector
 		var mem gosigar.Mem
 		if err := mem.Get(); err == nil {
 			allowance := int(mem.Total / 1024 / 1024 / 3)
@@ -243,11 +248,20 @@ func main() {
 // It creates a default node based on the command line arguments and runs it in
 // blocking mode, waiting for it to be shut down.
 func XDC(ctx *cli.Context) error {
+	if args := ctx.Args(); len(args) > 0 {
+		return fmt.Errorf("invalid command: %q", args[0])
+	}
 	node, cfg := makeFullNode(ctx)
 	startNode(ctx, node, cfg)
 	node.Wait()
 	return nil
 }
+// func XDC(ctx *cli.Context) error {
+// 	node, cfg := makeFullNode(ctx)
+// 	startNode(ctx, node)
+// 	node.Wait()
+// 	return nil
+// }
 
 // startNode boots up the system node and all registered protocols, after which
 // it unlocks any requested accounts, and starts the RPC/IPC interfaces and the
@@ -307,11 +321,11 @@ func startNode(ctx *cli.Context, stack *node.Node, cfg XDCConfig) {
 				status, _ := event.Wallet.Status()
 				log.Info("New wallet appeared", "url", event.Wallet.URL(), "status", status)
 
+				derivationPath := accounts.DefaultBaseDerivationPath
 				if event.Wallet.URL().Scheme == "ledger" {
-					event.Wallet.SelfDerive(accounts.DefaultLedgerBaseDerivationPath, stateReader)
-				} else {
-					event.Wallet.SelfDerive(accounts.DefaultBaseDerivationPath, stateReader)
+					derivationPath = accounts.DefaultLedgerBaseDerivationPath
 				}
+				event.Wallet.SelfDerive(derivationPath, stateReader)
 
 			case accounts.WalletDropped:
 				log.Info("Old wallet dropped", "url", event.Wallet.URL())
